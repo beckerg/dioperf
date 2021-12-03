@@ -56,19 +56,23 @@
 #define BKT_SHIFT           (7)
 #endif
 
+#ifndef __aligned
+#define __aligned(_size)    __attribute__((__aligned__(_size)))
+#endif
+
 #define NELEM(_arr)         (sizeof((_arr)) / sizeof((_arr)[0]))
 
 struct tdargs {
-    pthread_t   thread;
-    u_int       tid;
-    u_long      itermax;
-    bool        random;
+    bool        random __aligned(64);
     bool        read;
     int         fd;
     size_t      iosz;
-    u_long     *bktv;
     u_long     *opsv;
+    u_long     *bktv;
+    pthread_t   thr;
+    u_int       tid;
     size_t      bktvsz;
+    u_long      opstot;
     long        usecs;
 };
 
@@ -81,13 +85,14 @@ struct latdat {
 
 struct latres {
     struct latdat v[16];
+    double latavg_latency;
+    u_long latavg_hits;
     u_long peakhits;
     u_int c;
     const char *name;
 };
 
 const char *progname;
-const char *device;
 const char *prefix;
 int verbosity;
 size_t riosz;
@@ -102,15 +107,15 @@ uint64_t itv_freq;
 uint64_t itv_alpha;
 uint64_t itv_omega;
 double usecs_per_cycle;
-long duration;
+time_t duration;
 char bnfile[128];
 
 struct latres latresv[2];
 
-double percentilev[] = {
-    50, 90, 95, 99, 99.9, 99.99
-};
-
+char percentilestrv[] = "50,90,95,99";
+char *percentilestr = percentilestrv;
+double *percentilev;
+u_int percentilec;
 
 pthread_barrier_t rwbarrier;
 struct tdargs *tdargsv;
@@ -354,27 +359,27 @@ test_main(void *arg)
             if (off >= partsz)
                 off = 0;
         }
-
     }
-
-    for (i = 0; i <= elapsed; ++i)
-        a->itermax += a->opsv[i];
 
     gettimeofday(&tv_stop, NULL);
     timersub(&tv_stop, &tv_start, &tv_diff);
     a->usecs = tv_diff.tv_sec * 1000000 + tv_diff.tv_usec;
 
+    for (i = 0; i < duration; ++i)
+        a->opstot += a->opsv[i];
+
     free(iobuf);
+
     pthread_exit(NULL);
 }
 
 void
 report_latency(struct tdargs *a, u_int jobs, struct latres *r)
 {
-    u_long latmin, latmax;
-    u_long itermax, hits;
-    u_long bytespersec;
     double latsum, usecs;
+    u_long latmin, latmax;
+    u_long opstot, hits;
+    u_long bytespersec;
     u_long *bktv;
     u_int i, j;
     int k;
@@ -384,15 +389,14 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
     if (jobs < 1)
         return;
 
-    itermax = 0;
+    opstot = 0;
     fp = NULL;
 
     for (j = 0; j < jobs; ++j)
-        itermax += a[j].itermax;
+        opstot += a[j].opstot;
 
-    for (k = 0; k < r->c; ++k) {
-        r->v[k].thresh = itermax * r->v[k].pct;
-    }
+    for (k = 0; k < r->c; ++k)
+        r->v[k].thresh = opstot * r->v[k].pct;
 
     /* Create a file and write out all the latency data.
      */
@@ -405,12 +409,8 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
             return;
         }
 
-        fprintf(fp, "#%9s %8s %10s", "LATENCY", "HITS", "PERCENTILE");
-
-        for (k = 0; k < r->c; ++k)
-            fprintf(fp, " %7.2lf%%", (r->v[k].pct * 100));
-
-        fprintf(fp, "\n");
+        fprintf(fp, "#%9s %8s %8s %10s\n",
+                "LATENCY", "HITS", "CENTILE", "PERCENTILE");
     }
 
     latmin = latmax = 0;
@@ -430,13 +430,14 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
             continue;
 
         usecs = itv_to_usecs(i << BKT_SHIFT);
-        latsum += bktv[i] * usecs;
-        hits += bktv[i];
 
         if (bktv[i] > r->peakhits)
             r->peakhits = bktv[i];
+        hits += bktv[i];
+
         if (latmin == 0)
             latmin = usecs;
+        latsum += bktv[i] * usecs;
 
         for (k = r->c - 1; k >= 0; --k) {
             if (r->v[k].latency > 0)
@@ -448,29 +449,37 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
             }
         }
 
-        /* TODO: Don't hardcode v[3]...
-         */
-        if (!fp || (r->v[3].latency && verbosity < 2))
+        if (!fp || r->c < 1)
             continue;
 
-        fprintf(fp, "%10.3lf %8lu %9.2lf%%\n",
-                usecs, bktv[i], (k >= 0) ? r->v[k].pct * 100 : 0);
+        if (r->v[r->c - 1].latency && verbosity < 2)
+            continue;
+
+        fprintf(fp, "%10.3lf %8lu %8lu", usecs, bktv[i], (hits * 100) / opstot);
+
+        if (k >= 0)
+            fprintf(fp, " %10.2lf\n", r->v[k].pct * 100);
+        else
+            fprintf(fp, " %10s\n", "-");
     }
 
     if (fp)
         fclose(fp);
 
-    bytespersec = (itermax * a->iosz * 1000000) / a->usecs;
+    r->latavg_latency = latsum / hits;
+    r->latavg_hits = bktv[ (u_long)(r->latavg_latency / usecs_per_cycle) >> BKT_SHIFT ];
+
+    bytespersec = (opstot * a->iosz * 1000000) / a->usecs;
     latmax = usecs;
 
-    printf("%12lu  %s avg latency (us)\n", (u_long)(latsum / hits), r->name);
+    printf("%12lu  %s avg latency (us)\n", (u_long)r->latavg_latency, r->name);
     printf("%12lu  %s min latency (us)\n", latmin, r->name);
     printf("%12lu  %s max latency (us)\n", latmax, r->name);
 
     printf("%12u  %s threads\n", jobs, r->name);
     printf("%12zu  %s I/O size\n", a->iosz, r->name);
-    printf("%12lu  %s iterations\n", a->itermax, r->name);
-    printf("%12lu  %s avg ops/sec\n", (itermax * 1000000ul) / a->usecs, r->name);
+    printf("%12lu  %s operations\n", opstot, r->name);
+    printf("%12lu  %s avg ops/sec\n", (opstot * 1000000ul) / a->usecs, r->name);
     printf("%12lu  %s avg MiB/sec\n", bytespersec >> 20, r->name);
     printf("\n");
 }
@@ -478,7 +487,7 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
 void
 report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 {
-    char fnops[256], fnplot[256], fnrlat[256], fnwlat[256];
+    char fnops[256], fnplot[256];
     const char *wcolor = "orange";
     const char *rcolor = "cyan";
     const char *pcolor = "blue";
@@ -486,7 +495,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     const char *term = "png";
     int xtics, mxtics;
     FILE *fp;
-    long i;
+    time_t i;
+    u_int j;
     int k;
 
     if (!prefix)
@@ -495,8 +505,6 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     /* Create a file and write out all the time series data.
      */
     snprintf(fnops, sizeof(fnops), "%s.ops", bnfile);
-    snprintf(fnrlat, sizeof(fnrlat), "%s.rlat", bnfile);
-    snprintf(fnwlat, sizeof(fnwlat), "%s.wlat", bnfile);
 
     fp = fopen(fnops, "w");
     if (!fp) {
@@ -504,16 +512,20 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         return;
     }
 
-    fprintf(fp, "#%11s %5s %7s %7s %7s %s\n",
-            "TIME", "SECS", "ROPS", "WOPS", "RWOPS", "TDOPS");
+    fprintf(fp, "#%11s %5s %7s %7s %7s",
+            "TIME", "SECS", "ROPS", "WOPS", "RWOPS");
+
+    for (j = 0; j < rjobs + wjobs; ++j)
+        fprintf(fp, " %6u%s", j, (j < rjobs) ? "r" : "w");
+    fprintf(fp, "\n");
 
     for (i = 0; i < duration; ++i) {
         u_long rops = 0, wops = 0;
         size_t pos = 0;
-        int j, n;
+        int n;
 
         for (j = 0; j < jobs; ++j) {
-            n = snprintf(buf + pos, sizeof(buf) - pos, " %6lu", a[j].opsv[i]);
+            n = snprintf(buf + pos, sizeof(buf) - pos, " %7lu", a[j].opsv[i]);
             if (n < 1 || n >= sizeof(buf) - pos)
                 abort();
 
@@ -525,7 +537,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
             pos += n;
         }
 
-        fprintf(fp, "%12ld %5ld %7lu %7lu %7lu %s\n",
+        fprintf(fp, "%12ld %5ld %7lu %7lu %7lu%s\n",
                 t0 + i, i, rops, wops, rops + wops, buf);
     }
 
@@ -633,9 +645,13 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                     pcolor, r[0].v[k].pct * 100);
         }
 
-        fprintf(fp, "plot '%s' every ::1:::0 using ($1):($2) with lines "
+        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1 "
+                "lc rgb '%s' front # average latency\n",
+                k + 1, r[0].latavg_latency, r[0].latavg_hits, pcolor);
+
+        fprintf(fp, "plot '%s.rlat' every ::1:::0 using ($1):($2) with lines "
                 "lc rgb '%s' title 'reader%s'\n",
-                fnrlat, rcolor, (rjobs > 1) ? "s" : "");
+                bnfile, rcolor, (rjobs > 1) ? "s" : "");
     }
 
     if (wjobs > 0) {
@@ -652,9 +668,13 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                     pcolor, r[1].v[k].pct * 100);
         }
 
-        fprintf(fp, "plot '%s' every ::1:::0 using ($1):($2) with lines "
+        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1 "
+                "lc rgb '%s' front # average latency\n",
+                k + 1, r[1].latavg_latency, r[1].latavg_hits, pcolor);
+
+        fprintf(fp, "plot '%s.wlat' every ::1:::0 using ($1):($2) with lines "
                 "lc rgb '%s' title 'writer%s'\n",
-                fnwlat, wcolor, (wjobs > 1) ? "s" : "");
+                bnfile, wcolor, (wjobs > 1) ? "s" : "");
     }
 
     fprintf(fp, "unset multiplot\n");
@@ -670,27 +690,32 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 void
 usage(void)
 {
-    printf("usage: %s [options] <device> [prefix]\n", progname);
+    printf("usage: %s [options] <device> ...\n", progname);
     printf("usage: %s -h\n", progname);
-    printf("-d secs     duration (seconds) (default: %ld)\n", duration);
+    printf("-d secs     specify test duration (seconds) (default: %ld)\n", duration);
+    printf("-g prefix   specify output file name prefix\n");
     printf("-h          print this help list\n");
-    printf("-P          precondition partition with random data\n");
-    printf("-p partsz   max partition size (i.e., max I/O offset)\n");
+    printf("-I          initialize the partition with random data\n");
+    printf("-P pctlist  specify a list of percentiles (default: %s)\n", percentilestr);
+    printf("-l partsz   specify the max partition size to use\n");
     printf("-R rdargs   same as -r but sequential\n");
-    printf("-r rdargs   reader args for random i/o (rdjobs[,rdsize])\n");
+    printf("-r rdargs   args for random i/o reader threads\n");
     printf("-v          increase verbosity\n");
     printf("-W wrargs   same as -w but sequential\n");
-    printf("-w wrargs   writer args for random i/o (wrjobs[,wrsize])\n");
-    printf("device  device or file name to test\n");
-    printf("prefix  prefix for generated data files\n");
+    printf("-w wrargs   args for random i/o writer threads\n");
+    printf("\n");
+    printf("<device>  device or file name to test\n");
+    printf("rdargs    rdjobs[,rdsize] (default: %u,%zu)\n", rjobs, riosz);
+    printf("wrargs    wrjobs[,wrsize] (default: %u,%zu)\n", wjobs, wiosz);
 }
 
 int
 main(int argc, char **argv)
 {
     struct timeval tv_alpha;
-    int oflags, fd, rc;
     bool precondition;
+    int oflags, rc;
+    int fdv[argc];
     u_int i, j;
 
     progname = strrchr(argv[0], '/');
@@ -756,7 +781,7 @@ main(int argc, char **argv)
         char *errmsg, *end;
         int c;
 
-        c = getopt(argc, argv, ":d:hPp:R:r:vW:w:x");
+        c = getopt(argc, argv, ":d:g:hiP:p:R:r:vW:w:x");
         if (-1 == c)
             break;
 
@@ -771,12 +796,20 @@ main(int argc, char **argv)
             errmsg = "invalid duration";
             break;
 
+        case 'g':
+            prefix = optarg;
+            break;
+
         case 'h':
             usage();
             exit(0);
 
-        case 'P':
+        case 'i':
             precondition = true;
+            break;
+
+        case 'P':
+            percentilestr = optarg;
             break;
 
         case 'p':
@@ -818,6 +851,14 @@ main(int argc, char **argv)
             oflags &= ~O_DIRECT;
             break;
 
+        case ':':
+            syntax("option -%c requires an argument", optopt);
+            exit(EX_USAGE);
+
+        case '?':
+            syntax("invalid option -%c", optopt);
+            exit(EX_USAGE);
+
         default:
             eprint(0, "option -%c ignored", c);
             break;
@@ -840,30 +881,38 @@ main(int argc, char **argv)
         exit(EX_USAGE);
     }
 
-    device = argv[0];
-    prefix = argv[1];
-
     if (rjobs < 1 && wjobs < 1)
         rjobs = 1;
 
-    if (0 == strncmp(device, "/dev/", 5)) {
-        riosz = roundup(riosz, 512);
-        wiosz = roundup(wiosz, 512);
-        if (riosz == 0 && wiosz == 0) {
-            eprint(EINVAL, "invalid read or write size");
-            exit(EX_USAGE);
+    if (1) {
+        char *tok, *end;
+        u_int c = 0;
+
+        percentilev = calloc(strlen(percentilestr), sizeof(*percentilev));
+        if (!percentilev)
+            abort();
+
+        while (( tok = strsep(&percentilestr, ",;- ") ))
+            percentilev[c++] = strtod(tok, &end);
+
+        /* TODO: Sort...
+         */
+        percentilec = c;
+    }
+
+    for (i = 0; i < argc; ++i) {
+        fdv[i] = open(argv[i], oflags);
+        if (-1 == fdv[i]) {
+            eprint(errno, "unable to open %s", argv[i]);
+            exit(EX_NOINPUT);
         }
     }
 
-    fd = open(device, oflags);
-    if (-1 == fd) {
-        eprint(errno, "unable to open %s", device);
-        exit(EX_NOINPUT);
-    }
-
-    partend = lseek(fd, 0, SEEK_END);
+    /* TODO: Deal with multiple devices...
+     */
+    partend = lseek(fdv[0], 0, SEEK_END);
     if (-1 == partend) {
-        eprint(errno, "unable to seek to end of %s", device);
+        eprint(errno, "unable to seek to end of %s", argv[0]);
         exit(EX_OSERR);
     }
 
@@ -915,7 +964,7 @@ main(int argc, char **argv)
 
         for (i = 0; i < precondsz / iobufsz; ++i) {
 
-            cc = pwrite(fd, iobuf + ((i * 4096) % iobufsz), iobufsz, i * iobufsz);
+            cc = pwrite(fdv[0], iobuf + ((i * 4096) % iobufsz), iobufsz, i * iobufsz);
 
             if (cc != iobufsz) {
                 eprint(errno, "\nprecond 1: pwrite cc=%ld (i=%d)\n", cc, i);
@@ -960,7 +1009,7 @@ main(int argc, char **argv)
         struct tdargs *a = tdargsv + j;
 
         a->tid = j;
-        a->fd = fd;
+        a->fd = fdv[j % argc];
 
         if (j < rjobs) {
             a->iosz = riosz;
@@ -980,7 +1029,7 @@ main(int argc, char **argv)
 
         a->opsv = a->bktv + BKT_MAX;
 
-        rc = pthread_create(&a->thread, NULL, test_main, a);
+        rc = pthread_create(&a->thr, NULL, test_main, a);
         if (rc) {
             eprint(rc, "pthread_create");
             exit(EX_OSERR);
@@ -1005,9 +1054,9 @@ main(int argc, char **argv)
         struct tdargs *a = tdargsv + j;
         void *val;
 
-        rc = pthread_join(a->thread, &val);
+        rc = pthread_join(a->thr, &val);
         if (rc) {
-            eprint(rc, "pthread_join");
+            eprint(rc, "pthread_join tid %d failed", j);
             exit(EX_OSERR);
         }
     }
@@ -1021,13 +1070,8 @@ main(int argc, char **argv)
     printf("\n");
 
     if (prefix) {
-        const char *bndevice;
-
-        bndevice = strrchr(device, '/');
-        bndevice = bndevice ? bndevice + 1 : device;
-
-        snprintf(bnfile, sizeof(bnfile), "%s-%s-%s%u-%s%u-%ld",
-                 prefix, bndevice,
+        snprintf(bnfile, sizeof(bnfile), "%s-%s%u-%s%u-%ld",
+                 prefix,
                  rsequential ? "R" : "r", rjobs,
                  wsequential ? "W" : "w", wjobs,
                  tv_alpha.tv_sec);
@@ -1035,12 +1079,12 @@ main(int argc, char **argv)
 
     memset(latresv, 0, sizeof(latresv));
     latresv[0].name = "reader";
-    latresv[0].c = NELEM(percentilev);
+    latresv[0].c = percentilec;
 
     latresv[1].name = "writer";
-    latresv[1].c = NELEM(percentilev);
+    latresv[1].c = percentilec;
 
-    for (i = 0; i < NELEM(percentilev); ++i) {
+    for (i = 0; i < percentilec; ++i) {
         latresv[0].v[i].pct = percentilev[i] / 100;
         latresv[1].v[i].pct = percentilev[i] / 100;
     }
@@ -1056,7 +1100,10 @@ main(int argc, char **argv)
     }
 
     pthread_barrier_destroy(&rwbarrier);
-    close(fd);
+    free(percentilev);
+
+    for (i = 0; i < argc; ++i)
+        close(fdv[i]);
 
     return 0;
 }
