@@ -87,6 +87,8 @@ struct latres {
     struct latdat v[16];
     double latavg_latency;
     u_long latavg_hits;
+    double latmax_latency;
+    u_long latmax_hits;
     u_long peakhits;
     u_int c;
     const char *name;
@@ -94,6 +96,7 @@ struct latres {
 
 const char *progname;
 const char *prefix;
+const char *term;
 int verbosity;
 size_t riosz;
 size_t wiosz;
@@ -245,6 +248,11 @@ syntax(const char *fmt, ...)
     fprintf(stderr, "%s: %s, use -h for help\n", progname, msg);
 }
 
+/* On FreeBSD this "just works".  On Linux you need to set
+ * vm.nr_hugepages in /etc/sysctl.conf to something adquetely
+ * large in order for this to allocate superpages.  Or maybe
+ * use transparent huge pages (THP), or hugetblfs.  Yuk...
+ */
 void *
 super_alloc(size_t sz)
 {
@@ -286,10 +294,11 @@ test_main(void *arg)
 {
     struct timeval tv_start, tv_stop, tv_diff;
     struct tdargs *a = arg;
+    uint64_t partsz_mask;
+    uint64_t iosz_mask;
     uint64_t itv_next;
     u_long elapsed;
     u_long *iobuf;
-    uint64_t mask;
     off_t off;
     int i;
 
@@ -306,8 +315,20 @@ test_main(void *arg)
 
     memset(a->bktv, 0, a->bktvsz);
 
-    mask = ~((1ul << ilog2(a->iosz)) - 1);
-    off = (xoroshiro128plus(state) % partsz) & mask;
+    iosz_mask = ~((1ul << ilog2(a->iosz)) - 1);
+    off = (xoroshiro128plus(state) % partsz) & iosz_mask;
+
+    /* partsz_mask is used to eliminate the modulus operation
+     * otherwise needed to compute the next random offset.
+     * TODO: Need to verify, the addition compare/branch
+     * may nullify the benefit.
+     *
+     * TODO: If partsz is not a power of two then this will
+     * yield a non-uniform distribution (worst case 25%
+     * of the offsets will occur 25% frequently, right???)
+     */
+    partsz_mask = ((2ul << ilog2(partsz)) - 1);
+    partsz_mask &= iosz_mask;
 
     pthread_barrier_wait(&rwbarrier);
     gettimeofday(&tv_start, NULL);
@@ -353,7 +374,9 @@ test_main(void *arg)
         }
 
         if (a->random) {
-            off = (xoroshiro128plus(state) % partsz) & mask;
+            off = xoroshiro128plus(state) & partsz_mask;
+            if (off >= partsz)
+                off = (off + partsz) & partsz_mask;
         } else {
             off += a->iosz;
             if (off >= partsz)
@@ -376,14 +399,12 @@ test_main(void *arg)
 void
 report_latency(struct tdargs *a, u_int jobs, struct latres *r)
 {
-    double latsum, usecs;
-    u_long latmin, latmax;
+    char fnlat[256];
+    double latsum, latmin, usecs;
     u_long opstot, hits;
     u_long bytespersec;
     u_long *bktv;
-    u_int i, j;
-    int k;
-    char fnlat[256];
+    u_int i, j, k;
     FILE *fp;
 
     if (jobs < 1)
@@ -413,11 +434,10 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
                 "LATENCY", "HITS", "CENTILE", "PERCENTILE");
     }
 
-    latmin = latmax = 0;
+    latsum = latmin = usecs = 0;
     bktv = a->bktv;
-    latsum = 0;
-    usecs = 0;
     hits = 0;
+    k = 0;
 
     for (i = 0; i < BKT_MAX; ++i) {
         for (j = 1; j < jobs; ++j) {
@@ -439,26 +459,21 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
             latmin = usecs;
         latsum += bktv[i] * usecs;
 
-        for (k = r->c - 1; k >= 0; --k) {
-            if (r->v[k].latency > 0)
-                break;
-
+        if (k < r->c) {
             if (hits >= r->v[k].thresh) {
                 r->v[k].latency = usecs;
                 r->v[k].hits = bktv[i];
+                ++k;
             }
         }
 
-        if (!fp || r->c < 1)
-            continue;
-
-        if (r->v[r->c - 1].latency && verbosity < 2)
+        if (!fp)
             continue;
 
         fprintf(fp, "%10.3lf %8lu %8lu", usecs, bktv[i], (hits * 100) / opstot);
 
-        if (k >= 0)
-            fprintf(fp, " %10.2lf\n", r->v[k].pct * 100);
+        if (k > 0)
+            fprintf(fp, " %10.2lf\n", r->v[k - 1].pct * 100);
         else
             fprintf(fp, " %10s\n", "-");
     }
@@ -469,12 +484,14 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
     r->latavg_latency = latsum / hits;
     r->latavg_hits = bktv[ (u_long)(r->latavg_latency / usecs_per_cycle) >> BKT_SHIFT ];
 
-    bytespersec = (opstot * a->iosz * 1000000) / a->usecs;
-    latmax = usecs;
+    r->latmax_latency = usecs;
+    r->latmax_hits = bktv[ (u_long)(r->latmax_latency / usecs_per_cycle) >> BKT_SHIFT ];
 
-    printf("%12lu  %s avg latency (us)\n", (u_long)r->latavg_latency, r->name);
-    printf("%12lu  %s min latency (us)\n", latmin, r->name);
-    printf("%12lu  %s max latency (us)\n", latmax, r->name);
+    bytespersec = (opstot * a->iosz * 1000000) / a->usecs;
+
+    printf("%12.1lf  %s avg latency (us)\n", r->latavg_latency, r->name);
+    printf("%12.1lf  %s min latency (us)\n", latmin, r->name);
+    printf("%12.1lf  %s max latency (us)\n", r->latmax_latency, r->name);
 
     printf("%12u  %s threads\n", jobs, r->name);
     printf("%12zu  %s I/O size\n", a->iosz, r->name);
@@ -492,8 +509,9 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     const char *rcolor = "cyan";
     const char *pcolor = "blue";
     char buf[128 + jobs * 16];
-    const char *term = "png";
     int xtics, mxtics;
+    int fontsize = 10;
+    u_long peakops;
     FILE *fp;
     time_t i;
     u_int j;
@@ -519,6 +537,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         fprintf(fp, " %6u%s", j, (j < rjobs) ? "r" : "w");
     fprintf(fp, "\n");
 
+    peakops = 0;
+
     for (i = 0; i < duration; ++i) {
         u_long rops = 0, wops = 0;
         size_t pos = 0;
@@ -536,6 +556,9 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 
             pos += n;
         }
+
+        if (rops + wops > peakops)
+            peakops = rops + wops;
 
         fprintf(fp, "%12ld %5ld %7lu %7lu %7lu%s\n",
                 t0 + i, i, rops, wops, rops + wops, buf);
@@ -581,27 +604,31 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     //fprintf(fp, "set origin 0, 0.24\n");
     fprintf(fp, "set autoscale\n");
     fprintf(fp, "set grid\n");
-    fprintf(fp, "set ytics autofreq\n");
 
     fprintf(fp, "set multiplot layout %d,1 columnsfirst\n",
             rjobs && wjobs ? 3 : 2);
 
-    fprintf(fp, "set title '%s operations per second'\n",
+    fprintf(fp, "set title '%s operations' offset 0, -1\n",
             rjobs && wjobs ? "r/w" : (rjobs ? "read" : "write"));
 
     fprintf(fp, "set xlabel 'seconds'\n");
+    fprintf(fp, "set xtics autofreq nomirror font ',%d'\n", fontsize);
     fprintf(fp, "set xtics 0, %d rotate by -30\n", xtics);
     fprintf(fp, "set mxtics %d\n", mxtics);
 
-    fprintf(fp, "set ylabel 'ops'\n");
+    fprintf(fp, "set ylabel '%s operations per second'\n",
+            rjobs && wjobs ? "r/w" : (rjobs ? "read" : "write"));
+    fprintf(fp, "set ytics autofreq font ',%d'\n", fontsize);
     fprintf(fp, "set mytics 2\n");
+    fprintf(fp, "set yrange [-%lu:%lu]\n",
+            peakops / 12, peakops + (peakops / 12));
 
     fprintf(fp, "plot ");
 
     if (rjobs > 0) {
         fprintf(fp,
-                "'%s' every ::1:::0 using ($2):($3) with lines "
-                "lc rgb '%s' title 'readers %d, %s, %zu-bytes' %s",
+                "'%s' every ::1:::0 using ($2):($3) with lines"
+                " lc rgb '%s' title 'readers %d, %s, %zu-bytes' %s",
                 fnops, rcolor, rjobs,
                 rsequential ? "sequential" : "random",
                 riosz,
@@ -610,8 +637,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 
     if (wjobs > 0) {
         fprintf(fp,
-                "'%s' every ::1:::0 using ($2):($4) with lines "
-                "lc rgb '%s' title 'writers %d, %s, %zu-bytes' %s",
+                "'%s' every ::1:::0 using ($2):($4) with lines"
+                " lc rgb '%s' title 'writers %d, %s, %zu-bytes' %s",
                 fnops, wcolor, wjobs,
                 wsequential ? "sequential" : "random",
                 wiosz,
@@ -627,53 +654,109 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 
     fprintf(fp, "set xlabel 'buckets (usecs +/- %ldns)'\n",
             (long)(itv_to_usecs(1u << BKT_SHIFT) * 1000));
-    fprintf(fp, "set xtics autofreq\n");
     fprintf(fp, "set mxtics 10\n");
     fprintf(fp, "set ylabel 'hits'\n");
 
     if (rjobs > 0) {
-        fprintf(fp, "set title 'read latency histogram'\n");
-        fprintf(fp, "set yrange [-%lu:]\n", r[0].peakhits / 10);
+        double latmax = r[0].latmax_latency;
+
+        fprintf(fp, "set title 'read latency' offset 0, -1\n");
+        fprintf(fp, "set xtics auto nomirror font ',%d'\n", fontsize);
+        fprintf(fp, "set autoscale xfix\n");
+
+        if (r[0].c >= 0) {
+            const char *comma = "";
+            size_t len = 0;
+
+            fprintf(fp, "set x2tics auto nomirror rotate by 30 font ',%d' (", fontsize);
+
+            for (k = 0; k < r[0].c; ++k) {
+                if (r[0].v[k].latency) {
+                    fprintf(fp, "%s '%s' %.3lf",
+                            comma, percentilestr + len, r[0].v[k].latency);
+
+                    len += strlen(percentilestr + len) + 1;
+                    latmax = r[0].v[k].latency;
+                    comma = ",";
+                }
+            }
+
+            fprintf(fp, "%s 'avg' %.3lf )\n", comma, r[0].latavg_latency);
+            fprintf(fp, "set autoscale x2fix\n");
+        }
 
         for (k = 0; k < r[0].c; ++k) {
             if (!r[0].v[k].latency)
                 continue;
 
-            fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 3 "
-                    "lc rgb '%s' front # %.2lfth percentile\n",
+            fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1"
+                    " lc rgb '%s' front # %.2lf percentile\n",
                     k + 1, r[0].v[k].latency, r[0].v[k].hits,
                     pcolor, r[0].v[k].pct * 100);
         }
 
-        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1 "
-                "lc rgb '%s' front # average latency\n",
+        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 3"
+                " lc rgb '%s' front # average latency\n",
                 k + 1, r[0].latavg_latency, r[0].latavg_hits, pcolor);
 
-        fprintf(fp, "plot '%s.rlat' every ::1:::0 using ($1):($2) with lines "
-                "lc rgb '%s' title 'reader%s'\n",
+        fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
+        fprintf(fp, "set yrange [-%lu:%lu]\n",
+                r[0].peakhits / 12, r[0].peakhits + (r[0].peakhits / 12));
+
+        fprintf(fp, "plot '%s.rlat' every ::1:::0 using ($1):($2) with lines"
+                " lc rgb '%s' title 'reader%s'\n",
                 bnfile, rcolor, (rjobs > 1) ? "s" : "");
     }
 
     if (wjobs > 0) {
-        fprintf(fp, "set title 'write latency histogram'\n");
-        fprintf(fp, "set yrange [-%lu:]\n", r[1].peakhits / 10);
+        double latmax = r[1].latmax_latency;
+
+        fprintf(fp, "set title 'write latency' offset 0, -1\n");
+        fprintf(fp, "set xtics autofreq nomirror font ',%d'\n", fontsize);
+        fprintf(fp, "set autoscale xfix\n");
+
+        if (r[0].c >= 0) {
+            const char *comma = "";
+            size_t len = 0;
+
+            fprintf(fp, "set x2tics auto nomirror rotate by 30 font ',%d' (", fontsize);
+
+            for (k = 0; k < r[1].c; ++k) {
+                if (r[1].v[k].latency) {
+                    fprintf(fp, "%s '%s' %.3lf",
+                            comma, percentilestr + len, r[1].v[k].latency);
+
+                    len += strlen(percentilestr + len) + 1;
+                    latmax = r[1].v[k].latency;
+                    comma = ",";
+                }
+            }
+
+            fprintf(fp, "%s 'avg' %.3lf )\n", comma, r[1].latavg_latency);
+            fprintf(fp, "set autoscale x2fix\n");
+        }
+
 
         for (k = 0; k < r[1].c; ++k) {
             if (!r[1].v[k].latency)
                 continue;
 
-            fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 3 "
-                    "lc rgb '%s' front # %.2lfth percentile\n",
+            fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1"
+                    " lc rgb '%s' front # %.2lf percentile\n",
                     k + 1, r[1].v[k].latency, r[1].v[k].hits,
                     pcolor, r[1].v[k].pct * 100);
         }
 
-        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1 "
-                "lc rgb '%s' front # average latency\n",
+        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 3"
+                " lc rgb '%s' front # average latency\n",
                 k + 1, r[1].latavg_latency, r[1].latavg_hits, pcolor);
 
-        fprintf(fp, "plot '%s.wlat' every ::1:::0 using ($1):($2) with lines "
-                "lc rgb '%s' title 'writer%s'\n",
+        fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
+        fprintf(fp, "set yrange [-%lu:%lu]\n",
+                r[1].peakhits / 12, r[1].peakhits + (r[1].peakhits / 12));
+
+        fprintf(fp, "plot '%s.wlat' every ::1:::0 using ($1):($2) with lines"
+                " lc rgb '%s' title 'writer%s'\n",
                 bnfile, wcolor, (wjobs > 1) ? "s" : "");
     }
 
@@ -700,6 +783,7 @@ usage(void)
     printf("-l partsz   specify the max partition size to use\n");
     printf("-R rdargs   same as -r but sequential\n");
     printf("-r rdargs   args for random i/o reader threads\n");
+    printf("-T term     specify gnuplot term type (default: %s)\n", term);
     printf("-v          increase verbosity\n");
     printf("-W wrargs   same as -w but sequential\n");
     printf("-w wrargs   args for random i/o writer threads\n");
@@ -728,6 +812,7 @@ main(int argc, char **argv)
     riosz = wiosz = 4096;
     rjobs = wjobs = 0;
     duration = 60;
+    term = "png";
     partend = 0;
     partsz = 0;
 
@@ -781,7 +866,7 @@ main(int argc, char **argv)
         char *errmsg, *end;
         int c;
 
-        c = getopt(argc, argv, ":d:g:hiP:p:R:r:vW:w:x");
+        c = getopt(argc, argv, ":d:g:hiP:p:R:r:T:vW:w:x");
         if (-1 == c)
             break;
 
@@ -828,6 +913,10 @@ main(int argc, char **argv)
                 errmsg = "invalid read I/O size";
                 riosz = strtoul(end + 1, &end, 0);
             }
+            break;
+
+        case 'T':
+            term = optarg;
             break;
 
         case 'v':
@@ -885,19 +974,28 @@ main(int argc, char **argv)
         rjobs = 1;
 
     if (1) {
+        char *str = percentilestr;
         char *tok, *end;
-        u_int c = 0;
+        double prev, val;
 
         percentilev = calloc(strlen(percentilestr), sizeof(*percentilev));
         if (!percentilev)
             abort();
 
-        while (( tok = strsep(&percentilestr, ",;- ") ))
-            percentilev[c++] = strtod(tok, &end);
+        errno = 0;
+        prev = 0;
 
-        /* TODO: Sort...
-         */
-        percentilec = c;
+        while (( tok = strsep(&str, ",;: ") )) {
+            val = strtod(tok, &end);
+            if (errno || (end && *end) || val < prev) {
+                eprint(errno ?: EINVAL, "invalid percentile '%s' ignored", tok);
+                errno = 0;
+                continue;
+            }
+
+            percentilev[percentilec++] = val;
+            prev = val;
+        }
     }
 
     for (i = 0; i < argc; ++i) {
@@ -917,7 +1015,7 @@ main(int argc, char **argv)
     }
 
     if (partsz == 0)
-        partsz = partend * .50;
+        partsz = 1ul << ilog2(partend);
 
     if (partsz > partend)
         partsz = partend;
