@@ -1,30 +1,28 @@
 # Copyright (c) 2021 Greg Becker.  All rights reserved.
 
-
-# The only variables you might need to change in this makefile are:
-# PROG, SRC, HDR, LDLIBS, VPATH, and CDEFS.
-#
 PROG	:= dioperf
 
-SRC	:= dioperf.c
-
+SRC	:= ${PROG}.c
 HDR	:= ${patsubst %.c,%.h,${SRC}}
-HDR	+=
+OBJ	:= ${SRC:.c=.o}
 
 LDLIBS	:= -lpthread
 VPATH	:=
 
-NCT_VERSION	:= $(shell git describe --abbrev=10 --dirty --always --tags)
-PLATFORM	:= $(shell uname -s | tr 'a-z' 'A-Z')
+DIOPERF_VERSION	:= $(shell git describe --abbrev=10 --dirty --always --tags)
+PLATFORM	:= $(shell uname -s | tr 'A-Z' 'a-z')
 
 INCLUDE 	:= -I. -I../lib -I../../src/include
-CDEFS 		:= -DNCT_VERSION=\"${NCT_VERSION}\"
-CDEFS 		:= -D_GNU_SOURCE
+CDEFS 		:= -DDIOPERF_VERSION=\"${DIOPERF_VERSION}\"
 
-CFLAGS		+= -Wall -g -O2 ${INCLUDE}
+ifeq (${PLATFORM},linux)
+CDEFS		+= -D_GNU_SOURCE
+LDLIBS		+= -lbsd
+endif
+
+CFLAGS		+= -Wall -Wextra -g -O2 ${INCLUDE}
 DEBUG		:= -O0 -DDEBUG -UNDEBUG -fno-omit-frame-pointer
 CPPFLAGS	:= ${CDEFS}
-OBJ		:= ${SRC:.c=.o}
 
 # Always delete partially built targets.
 #
