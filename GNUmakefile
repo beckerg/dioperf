@@ -1,28 +1,28 @@
 # Copyright (c) 2021 Greg Becker.  All rights reserved.
 
-PROG	:= dioperf
+PROG := dioperf
 
-SRC	:= ${PROG}.c
-HDR	:= ${patsubst %.c,%.h,${SRC}}
-OBJ	:= ${SRC:.c=.o}
+SRC := ${PROG}.c
+HDR := ${patsubst %.c,%.h,${SRC}}
+OBJ := ${SRC:.c=.o}
 
-LDLIBS	:= -lpthread
-VPATH	:=
+PLATFORM := $(shell uname -s | tr 'A-Z' 'a-z')
+VERSION  := $(shell git describe --abbrev=10 --dirty --always --tags)
+PROGUC   := $(shell echo -n ${PROG} | tr 'a-z' 'A-Z')
 
-DIOPERF_VERSION	:= $(shell git describe --abbrev=10 --dirty --always --tags)
-PLATFORM	:= $(shell uname -s | tr 'A-Z' 'a-z')
+INCLUDE  := -I. -I../lib -I../../src/include
+CDEFS    := -D${PROGUC}_VERSION=\"${VERSION}\" -DNDEBUG
 
-INCLUDE 	:= -I. -I../lib -I../../src/include
-CDEFS 		:= -DDIOPERF_VERSION=\"${DIOPERF_VERSION}\"
+LDLIBS   := -lpthread
 
 ifeq (${PLATFORM},linux)
-CDEFS		+= -D_GNU_SOURCE
-LDLIBS		+= -lbsd
+CDEFS    += -D_GNU_SOURCE
+LDLIBS   += -lbsd
 endif
 
-CFLAGS		+= -Wall -Wextra -g -O2 ${INCLUDE}
-DEBUG		:= -O0 -DDEBUG -UNDEBUG -fno-omit-frame-pointer
-CPPFLAGS	:= ${CDEFS}
+CFLAGS   += -Wall -Wextra -g -O2 ${INCLUDE}
+DEBUG    := -O0 -UNDEBUG -fno-omit-frame-pointer
+CPPFLAGS := ${CDEFS}
 
 # Always delete partially built targets.
 #
@@ -47,7 +47,7 @@ cleandir clobber distclean: clean
 debug: CFLAGS += ${DEBUG}
 debug: ${PROG}
 
-native: CFLAGS += -march=native
+native: CFLAGS += -march=native -flto
 native: ${PROG}
 
 # Use gmake's link rule to produce the target.

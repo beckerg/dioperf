@@ -1,10 +1,37 @@
 /*
- * This tool generates various r/w workloads and measures and graphs
- * the throughput and latency of the device under test.
+ * Copyright (c) 2021, Greg Becker
+ * All rights reserved.
  *
- * cc -O2 -D_GNU_SOURCE -g dioperf.c -o dioperf -lm -lpthread
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * This tool generates various r/w workloads and measures and graphs
+ * the throughput and latency of the device under test.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -105,7 +132,7 @@ struct latres {
     struct latdat latdatv[16];
 };
 
-const char *wcolor[] = { "#cc0000", "#0000cc" };
+const char *wcolor[] = { "#cc0000", "#00ffff" };
 const char *rcolor[] = { "#00cccc", "#0000cc" };
 const char *term = "png";
 const char *progname;
@@ -348,13 +375,11 @@ void *
 rwtest(void *arg)
 {
     struct tdargs *a = arg;
-    uint64_t partsz_mask;
-    uint64_t iosz_mask;
+    uint64_t partsz_mask, iosz_mask;
     uint64_t itv_next;
+    ssize_t iosz, cc;
     time_t elapsed;
     u_long *iobuf;
-    ssize_t iosz;
-    ssize_t cc;
     off_t off;
     u_int i;
 
@@ -375,6 +400,10 @@ rwtest(void *arg)
 
     /* partsz_mask is used to eliminate the modulus operation
      * otherwise needed to compute the next random offset.
+     *
+     * TODO: In random mode, if partsz is not a power of two then
+     * this will yield a non-uniform distribution (worst case, 25%
+     * of the offsets will occur 25% more frequently, right???)
      */
     partsz_mask = ((2ul << ilog2(partsz)) - 1);
     partsz_mask &= iosz_mask;
@@ -388,8 +417,7 @@ rwtest(void *arg)
     /* TODO: Use locking to prevent overlapped I/O...
      */
     while (itv_next < itv_omega) {
-        uint64_t tstart, tstop;
-        suseconds_t dt;
+        uint64_t tstart, tstop, dt;
 
         tstart = itv_start();
 
@@ -400,9 +428,11 @@ rwtest(void *arg)
         tstop = itv_stop();
 
         if (unlikely( tstop >= itv_next )) {
-            if (++elapsed >= duration)
+            elapsed = itv_to_usecs(tstop - itv_alpha) / 1000000;
+            if (elapsed >= duration)
                 break;
-            itv_next += itv_freq;
+
+            itv_next = itv_alpha + (elapsed * itv_freq) + itv_freq;
         }
 
         dt = (tstop - tstart) >> BKT_SHIFT;
@@ -419,10 +449,6 @@ rwtest(void *arg)
             off += a->iosz;
         }
 
-        /* TODO: In random mode, if partsz is not a power of two then
-         * this will yield a non-uniform distribution (worst case, 25%
-         * of the offsets will occur 25% more frequently, right???)
-         */
         if (off >= partsz)
             off -= partsz;
     }
@@ -707,7 +733,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         fprintf(fp, "set xtics auto nomirror font ',%d'\n", fontsize);
         fprintf(fp, "set autoscale xfix\n");
 
-        if (r[0].latdatc >= 0) {
+        if (1) {
             const char *comma = "";
             size_t len = 0;
 
@@ -758,7 +784,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         fprintf(fp, "set xtics autofreq nomirror font ',%d'\n", fontsize);
         fprintf(fp, "set autoscale xfix\n");
 
-        if (r[0].latdatc >= 0) {
+        if (1) {
             const char *comma = "";
             size_t len = 0;
 
