@@ -457,7 +457,7 @@ rwtest(void *arg)
 
     if (cc != iosz) {
         eprint((cc == -1) ? errno : 0,
-               "tid %d: cc %ld != iosz %zu, off %ld\n",
+               "tid %d: cc %ld != iosz %zu, off %ld",
                a->tid, cc, iosz, off);
     }
 
@@ -554,17 +554,19 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
     if (fp)
         fclose(fp);
 
-    r->latavg_latency = latsum / hits;
-    r->latavg_hits = bktv[ (u_long)(r->latavg_latency / usecs_per_cycle) >> BKT_SHIFT ];
+    if (hits > 0) {
+        r->latavg_latency = latsum / hits;
+        r->latavg_hits = bktv[ (u_long)(r->latavg_latency / usecs_per_cycle) >> BKT_SHIFT ];
 
-    r->latmax_latency = usecs;
-    r->latmax_hits = bktv[ (u_long)(r->latmax_latency / usecs_per_cycle) >> BKT_SHIFT ];
+        r->latmax_latency = usecs;
+        r->latmax_hits = bktv[ (u_long)(r->latmax_latency / usecs_per_cycle) >> BKT_SHIFT ];
+
+        printf("%12.1lf  %s avg latency (us)\n", r->latavg_latency, r->name);
+        printf("%12.1lf  %s min latency (us)\n", latmin, r->name);
+        printf("%12.1lf  %s max latency (us)\n", r->latmax_latency, r->name);
+    }
 
     bytespersec = (opstot * a->iosz * 1000000) / a->usecs;
-
-    printf("%12.1lf  %s avg latency (us)\n", r->latavg_latency, r->name);
-    printf("%12.1lf  %s min latency (us)\n", latmin, r->name);
-    printf("%12.1lf  %s max latency (us)\n", r->latmax_latency, r->name);
 
     printf("%12u  %s threads\n", jobs, r->name);
     printf("%12zu  %s I/O size\n", a->iosz, r->name);
@@ -1110,8 +1112,14 @@ main(int argc, char **argv)
     for (i = 0; i < (u_int)argc; ++i) {
         off_t end;
 
+      retry:
         fdv[i] = open(argv[i], O_RDWR | directio);
         if (-1 == fdv[i]) {
+            if (directio) {
+                directio = false;
+                goto retry;
+            }
+
             eprint(errno, "unable to open %s", argv[i]);
             exit(EX_NOINPUT);
         }
