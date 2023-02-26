@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2021, Greg Becker
- * All rights reserved.
+ * Copyright (c) 2021,2023 Greg Becker.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -29,8 +28,8 @@
  */
 
 /*
- * This tool generates various r/w workloads and measures and graphs
- * the throughput and latency of the device under test.
+ * This tool generates various disk and file r/w workloads, and measures
+ * and graphs the throughput and latency of the device under test.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,6 +147,7 @@ u_int rjobs;
 u_int wjobs;
 off_t partend;
 off_t partsz;
+size_t zrunlen;
 char *mmapv[16];
 uint64_t itv_freq;
 uint64_t itv_alpha;
@@ -379,18 +379,34 @@ rwtest(void *arg)
     uint64_t itv_next;
     ssize_t iosz, cc;
     time_t elapsed;
-    u_long *iobuf;
+    size_t iobufsz;
+    void *iobuf;
     off_t off;
-    u_int i;
 
     xrand_init(rotl(itv_start(), a->tid % 64));
 
-    iobuf = aligned_alloc(4096, roundup(a->iosz, 4096));
+    iobufsz = roundup(a->iosz, 4096);
+    iobuf = aligned_alloc(4096, iobufsz);
     if (!iobuf)
         abort();
 
-    for (i = 0; i < a->iosz / sizeof(*iobuf); ++i)
-        iobuf[i] = xrand();
+    /* Fill the i/o buffer with either zrunlen length runs of random
+     * ASCII data (highly compressible) or with random binary data
+     * (largely incompressible). This is useful for testing against
+     * things like zfs and zram which can compress their blocks.
+     */
+    if (zrunlen > 0) {
+        for (size_t i = 0; i < iobufsz; i += zrunlen) {
+            size_t jmax = i + MIN(zrunlen, iobufsz - i);
+            uint8_t c = (xrand() % (127 - 32)) + 32;
+
+            for (size_t j = i; j < jmax; ++j)
+                ((uint8_t *)iobuf)[j] = c;
+        }
+    } else {
+        for (size_t i = 0; i < iobufsz / sizeof(uint64_t); ++i)
+            ((uint64_t *)iobuf)[i] = xrand();
+    }
 
     memset(a->bktv, 0, a->bktvsz);
 
@@ -461,7 +477,7 @@ rwtest(void *arg)
                a->tid, cc, iosz, off);
     }
 
-    for (i = 0; i < duration; ++i)
+    for (time_t i = 0; i < duration; ++i)
         a->opstot += a->opsv[i];
 
     free(iobuf);
@@ -861,6 +877,8 @@ usage(void)
     printf("-v          increase verbosity\n");
     printf("-W rdargs   sequential I/O writer thread args\n");
     printf("-w rdargs   random I/O writer thread args\n");
+    printf("-x          disable direct IO\n");
+    printf("-z runlen   run length of repeated write data bytes\n");
     printf("\n");
     printf("<device>  device or file name to test\n");
     printf("rdargs    rdjobs[,rdsize] (default: %u,%zu)\n", rjobs, riosz);
@@ -890,6 +908,7 @@ main(int argc, char **argv)
     dryrun = false;
     help = false;
     duration = 60;
+    zrunlen = 0;
     partsz = 0;
 
 #if USE_CLOCK
@@ -943,7 +962,7 @@ main(int argc, char **argv)
         char *errmsg, *end;
         int c;
 
-        c = getopt(argc, argv, ":d:hl:mno:P:R:r:T:VvW:w:x");
+        c = getopt(argc, argv, ":d:hl:mno:P:R:r:T:VvW:w:xz:");
         if (c == -1)
             break;
 
@@ -1031,6 +1050,11 @@ main(int argc, char **argv)
 
         case 'x':
             directio = 0;
+            break;
+
+        case 'z':
+            zrunlen = strtoul(optarg, &end, 0);
+            errmsg = "invalid run length";
             break;
 
         case ':':
