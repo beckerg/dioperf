@@ -31,6 +31,12 @@
  * This tool generates various disk and file r/w workloads, and measures
  * and graphs the throughput and latency of the device under test.
  */
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/param.h>
+#include <sys/resource.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -40,15 +46,12 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
+#include <signal.h>
 #include <string.h>
 #include <sysexits.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/mman.h>
-#include <sys/param.h>
-#include <sys/resource.h>
 
 #include <immintrin.h>
 #include <x86intrin.h>
@@ -100,7 +103,7 @@
 typedef ssize_t rwfunc_t(int, void *, size_t, off_t);
 
 struct tdargs {
-    rwfunc_t   *rwfunc __aligned(64);
+    rwfunc_t   *rwfunc __aligned(256);
     bool        random;
     int         fd;
     size_t      iosz;
@@ -109,7 +112,8 @@ struct tdargs {
     pthread_t   thr;
     u_int       tid;
     size_t      bktvsz;
-    u_long      opstot;
+
+    u_long      opstot __aligned(128);
     long        usecs;
 };
 
@@ -153,7 +157,8 @@ uint64_t itv_freq;
 uint64_t itv_alpha;
 uint64_t itv_omega;
 double usecs_per_cycle;
-time_t duration;
+volatile time_t duration;
+time_t status;
 char bnfile[128];
 
 struct latres latresv[2];
@@ -314,6 +319,21 @@ syntax(const char *fmt, ...)
     fprintf(stderr, "%s: %s, use -h for help\n", progname, msg);
 }
 
+volatile sig_atomic_t sigint;
+volatile sig_atomic_t siginfo;
+
+void
+sigint_isr(int code __unused)
+{
+    sigint = 1;
+}
+
+void
+siginfo_isr(int code __unused)
+{
+    siginfo = 1;
+}
+
 /* On FreeBSD this "just works".  On Linux you need to set
  * vm.nr_hugepages in /etc/sysctl.conf to something adquetely
  * large in order for this to allocate superpages.  Or maybe
@@ -458,15 +478,17 @@ rwtest(void *arg)
 
         ++a->opsv[elapsed];
         ++a->bktv[dt];
+        ++a->opstot;
 
         if (a->random) {
             off = xrand() & partsz_mask;
+            if (off >= partsz)
+                off -= partsz;
         } else {
             off += a->iosz;
+            if (off >= partsz)
+                off = 0;
         }
-
-        if (off >= partsz)
-            off -= partsz;
     }
 
     a->usecs = itv_to_usecs(itv_stop() - itv_alpha);
@@ -476,9 +498,6 @@ rwtest(void *arg)
                "tid %d: cc %ld != iosz %zu, off %ld",
                a->tid, cc, iosz, off);
     }
-
-    for (time_t i = 0; i < duration; ++i)
-        a->opstot += a->opsv[i];
 
     free(iobuf);
 
@@ -663,24 +682,27 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         return;
     }
 
-    switch (duration / 1800) {
-    case 0:
-        if (duration > 180) {
-            mxtics = 6;
-            xtics = 60;
-        } else {
-            mxtics = 2;
-            xtics = 10;
-        }
-        break;
-    case 1:
-        mxtics = 5;
-        xtics = 300;
-        break;
-    default:
+    if (duration <= 60) {
+        xtics = 10;
         mxtics = 10;
+    } else if (duration <= 180) {
+        xtics = 30;
+        mxtics = 3;
+    } else if (duration <= 900) {
+        xtics = 60;
+        mxtics = 6;
+    } else if (duration <= 3600) {
+        xtics = 300;
+        mxtics = 5;
+    } else if (duration <= 7200) {
         xtics = 600;
-        break;
+        mxtics = 10;
+    } else if (duration <= 14400) {
+        xtics = 900;
+        mxtics = 3;
+    } else {
+        xtics = 3600;
+        mxtics = 6;
     }
 
     fprintf(fp, "# Created on %s", ctime(&t0));
@@ -707,11 +729,15 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
             rjobs && wjobs ? "r/w" : (rjobs ? "read" : "write"));
     fprintf(fp, "set ytics autofreq font ',%d'\n", fontsize);
     fprintf(fp, "set mytics 2\n");
-    fprintf(fp, "set yrange [-%lu:%lu]\n",
-            peakops / 12, peakops + (peakops / 12));
+
+    fprintf(fp, "set autoscale y\n");
+    fprintf(fp, "set yrange [-%lu:]\n",
+            (u_long)(peakops * 0.05));
 
     fprintf(fp, "plot ");
 
+    /* Plot read ops graph.
+     */
     if (rjobs > 0) {
         fprintf(fp,
                 "'%s' every ::1:::0 using ($2):($3) with lines"
@@ -722,6 +748,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                 wjobs ? "," : "\n");
     }
 
+    /* Plot write ops graph.
+     */
     if (wjobs > 0) {
         fprintf(fp,
                 "'%s' every ::1:::0 using ($2):($4) with lines"
@@ -732,6 +760,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                 rjobs ? "," : "\n");
     }
 
+    /* Plot combined read+write ops graph.
+     */
     if (rjobs && wjobs) {
         fprintf(fp,
                 "'%s' every ::1:::0 using ($2):($5) with lines "
@@ -744,6 +774,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     fprintf(fp, "set mxtics 10\n");
     fprintf(fp, "set ylabel 'hits'\n");
 
+    /* Plot read latency graph.
+     */
     if (rjobs > 0) {
         double latmax = r[0].latmax_latency;
 
@@ -787,14 +819,25 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                 k + 1, r[0].latavg_latency, r[0].latavg_hits, rcolor[1]);
 
         fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
-        fprintf(fp, "set yrange [-%lu:%lu]\n",
-                r[0].peakhits / 12, r[0].peakhits + (r[0].peakhits / 12));
+
+        fprintf(fp, "set autoscale y\n");
+        if (r[0].latavg_hits > 0 && r[0].peakhits > r[0].latavg_hits * 100) {
+            fprintf(fp, "set logscale y\n");
+            fprintf(fp, "set mytics 10\n");
+        } else {
+            fprintf(fp, "unset logscale y\n");
+            fprintf(fp, "set yrange [-%lu:]\n",
+                    (u_long)(r[0].peakhits * 0.05));
+        }
+        fprintf(fp, "#peak %lu, avg %lu\n", r[0].peakhits, r[0].latavg_hits);
 
         fprintf(fp, "plot '%s.rlat' every ::1:::0 using ($1):($2) with lines"
                 " lc rgb '%s' title 'reader%s'\n",
                 bnfile, rcolor[0], (rjobs > 1) ? "s" : "");
     }
 
+    /* Plot write latency graph.
+     */
     if (wjobs > 0) {
         double latmax = r[1].latmax_latency;
 
@@ -823,7 +866,6 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
             fprintf(fp, "set autoscale x2fix\n");
         }
 
-
         for (k = 0; k < r[1].latdatc; ++k) {
             if (!r[1].latdatv[k].latency)
                 continue;
@@ -839,8 +881,17 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                 k + 1, r[1].latavg_latency, r[1].latavg_hits, wcolor[1]);
 
         fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
-        fprintf(fp, "set yrange [-%lu:%lu]\n",
-                r[1].peakhits / 12, r[1].peakhits + (r[1].peakhits / 12));
+
+        fprintf(fp, "set autoscale y\n");
+        if (r[1].latavg_hits > 0 && r[1].peakhits > r[1].latavg_hits * 100) {
+            fprintf(fp, "set logscale y\n");
+            fprintf(fp, "set mytics 10\n");
+        } else {
+            fprintf(fp, "unset logscale y\n");
+            fprintf(fp, "set yrange [-%lu:]\n",
+                    (u_long)(r[1].peakhits * 0.05));
+        }
+        fprintf(fp, "#peak %lu, avg %lu\n", r[1].peakhits, r[1].latavg_hits);
 
         fprintf(fp, "plot '%s.wlat' every ::1:::0 using ($1):($2) with lines"
                 " lc rgb '%s' title 'writer%s'\n",
@@ -866,7 +917,8 @@ usage(void)
     printf("-d secs     specify test duration (seconds) (default: %ld)\n", duration);
     printf("-h          print this help list\n");
     printf("-l partsz   specify the max partition size to use\n");
-    printf("-m          use mmap rather than pread/pwrite\n");
+    printf("-M          use mmap rather than pread/pwrite\n");
+    printf("-m mark     print status every mark seconds\n");
     printf("-n          dry run (i.e., issue zero-length reads/writes)\n");
     printf("-o prefix   specify output file name prefix\n");
     printf("-P pctlist  specify a list of percentiles (default: %s)\n", percentilestr);
@@ -888,6 +940,7 @@ usage(void)
 int
 main(int argc, char **argv)
 {
+    sigset_t sigset_all, sigset_old;
     struct timeval tv_alpha;
     bool version, help;
     int fdv[argc], rc;
@@ -962,7 +1015,7 @@ main(int argc, char **argv)
         char *errmsg, *end;
         int c;
 
-        c = getopt(argc, argv, ":d:hl:mno:P:R:r:T:VvW:w:xz:");
+        c = getopt(argc, argv, ":d:hl:Mm:no:P:R:r:T:VvW:w:xz:");
         if (c == -1)
             break;
 
@@ -971,10 +1024,33 @@ main(int argc, char **argv)
 
         switch (c) {
         case 'd':
+            errmsg = "invalid test duration";
             duration = strtol(optarg, &end, 0);
             if (duration < 1)
                 duration = 1;
-            errmsg = "invalid duration";
+            if (end && *end) {
+                errmsg = "invalid test time specifier";
+                switch (*end) {
+                case 'd':
+                    duration *= 86400;
+                    end = NULL;
+                    break;
+
+                case 'h':
+                    duration *= 3600;
+                    end = NULL;
+                    break;
+
+                case 'm':
+                    duration *= 60;
+                    end = NULL;
+                    break;
+
+                case 's':
+                    end = NULL;
+                    break;
+                }
+            }
             break;
 
         case 'h':
@@ -986,8 +1062,38 @@ main(int argc, char **argv)
             errmsg = "invalid partition size";
             break;
 
-        case 'm':
+        case 'M':
             use_mmap = true;
+            break;
+
+        case 'm':
+            errmsg = "invalid status duration";
+            status = strtol(optarg, &end, 0);
+            if (status < 1)
+                status = 1;
+            if (end && *end) {
+                errmsg = "invalid status time specifier";
+                switch (*end) {
+                case 'd':
+                    status *= 86400;
+                    end = NULL;
+                    break;
+
+                case 'h':
+                    status *= 3600;
+                    end = NULL;
+                    break;
+
+                case 'm':
+                    status *= 60;
+                    end = NULL;
+                    break;
+
+                case 's':
+                    end = NULL;
+                    break;
+                }
+            }
             break;
 
         case 'n':
@@ -1082,6 +1188,10 @@ main(int argc, char **argv)
     if (rjobs < 1 && wjobs < 1)
         rjobs = 1;
 
+    if (duration < 10)
+        duration = 10;
+    if (status == 0)
+        status = duration;
 
     if (help) {
         usage();
@@ -1154,7 +1264,7 @@ main(int argc, char **argv)
             exit(EX_OSERR);
         }
 
-        /* Use the smallest partition from the group...
+        /* Use the smallest partition from the group of drives...
          */
         if (end < partend)
             partend = end;
@@ -1195,7 +1305,6 @@ main(int argc, char **argv)
         }
     }
 
-
     tdargsv = aligned_alloc(4096, roundup((rjobs + wjobs) * sizeof(*tdargsv), 4096));
     if (!tdargsv) {
         eprint(errno, "alloc tdargsv failed");
@@ -1209,6 +1318,9 @@ main(int argc, char **argv)
         eprint(rc, "pthread_barrier");
         exit(EX_OSERR);
     }
+
+    sigfillset(&sigset_all);
+    sigprocmask(SIG_SETMASK, &sigset_all, &sigset_old);
 
     for (j = 0; j < rjobs + wjobs; ++j) {
         struct tdargs *a = tdargsv + j;
@@ -1255,6 +1367,58 @@ main(int argc, char **argv)
 
     pthread_barrier_wait(&rwbarrier);
 
+    signal(SIGINT, sigint_isr);
+    signal(SIGINFO, siginfo_isr);
+
+    while (1) {
+        uint64_t now = itv_cycles();
+        struct timespec timeout;
+
+        if (now + itv_freq >= itv_omega)
+            break;
+
+        timeout.tv_sec = itv_to_usecs(itv_omega - now) / 1000000;
+        timeout.tv_nsec = 0;
+
+        if (status < timeout.tv_sec) {
+            timeout.tv_sec = status - 1;
+            timeout.tv_nsec = 1000000000 - 100000;
+        }
+
+        rc = ppoll(NULL, 0, &timeout, &sigset_old);
+        if (rc && errno != EINTR)
+            printf("rc %d, errno %d\n", rc, errno);
+
+        if (sigint) {
+            duration = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
+            break;
+        }
+
+        if (siginfo || status < duration) {
+            time_t elapsed = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
+            u_long ropstot = 0;
+            u_long wopstot = 0;
+
+            for (j = 0; j < rjobs + wjobs; ++j) {
+                struct tdargs *a = tdargsv + j;
+
+                if (j < rjobs) {
+                    ropstot += a->opstot;
+                } else {
+                    wopstot += a->opstot;
+                }
+            }
+
+            printf("elapsed %3ld, remaining %3ld, rbytes %zu, wbytes %zu, "
+                   "ravgKB/s %zu, wavgKB/s %zu\n",
+                   elapsed, duration - elapsed,
+                   ropstot * riosz, wopstot * wiosz,
+                   (ropstot * riosz / elapsed) >> 10,
+                   (wopstot * wiosz / elapsed) >> 10);
+            siginfo = 0;
+        }
+    }
+
     for (j = 0; j < rjobs + wjobs; ++j) {
         struct tdargs *a = tdargsv + j;
         void *val;
@@ -1276,11 +1440,11 @@ main(int argc, char **argv)
     printf("\n");
 
     if (ofile) {
-        snprintf(bnfile, sizeof(bnfile), "%s-%s%u-%s%u-%ld",
+        snprintf(bnfile, sizeof(bnfile), "%s-%s%u-%s%u-d%ld-%ld",
                  ofile,
                  rsequential ? "R" : "r", rjobs,
                  wsequential ? "W" : "w", wjobs,
-                 tv_alpha.tv_sec);
+                 duration, tv_alpha.tv_sec);
     }
 
     memset(latresv, 0, sizeof(latresv));
