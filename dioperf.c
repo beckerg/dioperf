@@ -92,12 +92,12 @@
 
 /* Number of buckets in latency histogram ((1u << BKT_SHIFT) cycles per bucket).
  */
-#define BKT_MAX             (4 * 1024 * 1024)
+#define BKT_MAX             (8ul * 1024 * 1024)
 
 #if USE_CLOCK
 #define BKT_SHIFT           (0)
 #else
-#define BKT_SHIFT           (7)
+#define BKT_SHIFT           (8)
 #endif
 
 typedef ssize_t rwfunc_t(int, void *, size_t, off_t);
@@ -127,10 +127,11 @@ struct latdat {
 struct latres {
     const char *name;
     double latavg_latency;
-    u_long latavg_hits;
+    double latavg_hits;
     double latmax_latency;
     u_long latmax_hits;
     u_long peakhits;
+    u_long first;
     u_int latdatc;
     struct latdat latdatv[16];
 };
@@ -140,6 +141,7 @@ const char *rcolor[] = { "#00cccc", "#0000cc" };
 const char *term = "png";
 const char *progname;
 const char *ofile;
+int fontsize = 10;
 int verbosity;
 bool rsequential;
 bool wsequential;
@@ -158,12 +160,13 @@ uint64_t itv_alpha;
 uint64_t itv_omega;
 double usecs_per_cycle;
 volatile time_t duration;
-time_t status;
+time_t mark;
+time_t xclip;
 char bnfile[128];
 
 struct latres latresv[2];
 
-char percentilestrv[] = "50,90,95,99";
+char percentilestrv[] = "10,50,90,95";
 char *percentilestr = percentilestrv;
 double *percentilev;
 u_int percentilec;
@@ -448,6 +451,8 @@ rwtest(void *arg)
     elapsed = 0;
     cc = iosz;
 
+    /* Wait here for the master thread to start the test.
+     */
     pthread_barrier_wait(&rwbarrier);
 
     /* TODO: Use locking to prevent overlapped I/O...
@@ -511,8 +516,9 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
     double latsum, latmin, usecs;
     u_long opstot, hits;
     u_long bytespersec;
+    u_long first, last;
     u_long *bktv;
-    u_int i, j, k;
+    u_long i, j, k;
     FILE *fp;
 
     if (jobs < 1)
@@ -543,6 +549,7 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
     }
 
     latsum = latmin = usecs = 0;
+    first = last = 0;
     bktv = a->bktv;
     hits = 0;
     k = 0;
@@ -558,6 +565,9 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
             continue;
 
         usecs = itv_to_usecs(i << BKT_SHIFT);
+
+        if (last++ == 0)
+            first = usecs;
 
         if (bktv[i] > r->peakhits)
             r->peakhits = bktv[i];
@@ -591,7 +601,8 @@ report_latency(struct tdargs *a, u_int jobs, struct latres *r)
 
     if (hits > 0) {
         r->latavg_latency = latsum / hits;
-        r->latavg_hits = bktv[ (u_long)(r->latavg_latency / usecs_per_cycle) >> BKT_SHIFT ];
+        r->latavg_hits = (double)hits / last;
+        r->first = first;
 
         r->latmax_latency = usecs;
         r->latmax_hits = bktv[ (u_long)(r->latmax_latency / usecs_per_cycle) >> BKT_SHIFT ];
@@ -617,8 +628,6 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     char fnops[256], fnplot[256];
     char buf[128 + jobs * 16];
     int xtics, mxtics;
-    int fontsize = 10;
-    u_long peakops;
     u_int j, k;
     FILE *fp;
     time_t i;
@@ -643,8 +652,6 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         fprintf(fp, " %6u%s", j, (j < rjobs) ? "r" : "w");
     fprintf(fp, "\n");
 
-    peakops = 0;
-
     for (i = 0; i < duration; ++i) {
         u_long rops = 0, wops = 0;
         size_t pos = 0;
@@ -662,9 +669,6 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 
             pos += n;
         }
-
-        if (rops + wops > peakops)
-            peakops = rops + wops;
 
         fprintf(fp, "%12ld %5ld %7lu %7lu %7lu%s\n",
                 t0 + i, i, rops, wops, rops + wops, buf);
@@ -717,22 +721,20 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     fprintf(fp, "set multiplot layout %d,1 columnsfirst\n",
             rjobs && wjobs ? 3 : 2);
 
+    fprintf(fp, "\n");
     fprintf(fp, "set title '%s operations' offset 0, -1\n",
             rjobs && wjobs ? "r/w" : (rjobs ? "read" : "write"));
 
     fprintf(fp, "set xlabel 'seconds'\n");
     fprintf(fp, "set xtics autofreq nomirror font ',%d'\n", fontsize);
-    fprintf(fp, "set xtics 0, %d rotate by -30\n", xtics);
+    fprintf(fp, "set xtics 0,%d rotate by -30\n", xtics);
     fprintf(fp, "set mxtics %d\n", mxtics);
+    fprintf(fp, "set xrange [%ld:%ld]\n", xclip, duration - xclip);
 
     fprintf(fp, "set ylabel '%s operations per second'\n",
             rjobs && wjobs ? "r/w" : (rjobs ? "read" : "write"));
     fprintf(fp, "set ytics autofreq font ',%d'\n", fontsize);
     fprintf(fp, "set mytics 2\n");
-
-    fprintf(fp, "set autoscale y\n");
-    fprintf(fp, "set yrange [-%lu:]\n",
-            (u_long)(peakops * 0.05));
 
     fprintf(fp, "plot ");
 
@@ -769,67 +771,68 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                 fnops);
     }
 
+    fprintf(fp, "\n");
     fprintf(fp, "set xlabel 'buckets (usecs +/- %ldns)'\n",
             (long)(itv_to_usecs(1u << BKT_SHIFT) * 1000));
     fprintf(fp, "set mxtics 10\n");
-    fprintf(fp, "set ylabel 'hits'\n");
 
     /* Plot read latency graph.
      */
     if (rjobs > 0) {
         double latmax = r[0].latmax_latency;
+        size_t len = 0;
 
+        fprintf(fp, "\n");
         fprintf(fp, "set title 'read latency' offset 0, -1\n");
         fprintf(fp, "set xtics auto nomirror font ',%d'\n", fontsize);
         fprintf(fp, "set autoscale xfix\n");
-
-        if (1) {
-            const char *comma = "";
-            size_t len = 0;
-
-            fprintf(fp, "set x2tics auto nomirror rotate by 30 font ',%d' (", fontsize);
-
-            for (k = 0; k < r[0].latdatc; ++k) {
-                if (r[0].latdatv[k].latency) {
-                    fprintf(fp, "%s '%s' %.3lf",
-                            comma, percentilestr + len, r[0].latdatv[k].latency);
-
-                    len += strlen(percentilestr + len) + 1;
-                    latmax = r[0].latdatv[k].latency;
-                    comma = ",";
-                }
-            }
-
-            fprintf(fp, "%s 'avg' %.3lf )\n", comma, r[0].latavg_latency);
-            fprintf(fp, "set autoscale x2fix\n");
-        }
+        fprintf(fp, "set autoscale\n");
 
         for (k = 0; k < r[0].latdatc; ++k) {
             if (!r[0].latdatv[k].latency)
                 continue;
 
-            fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1"
-                    " lc rgb '%s' front # %.2lf percentile\n",
-                    k + 1, r[0].latdatv[k].latency, r[0].latdatv[k].hits,
-                    rcolor[1], r[0].latdatv[k].pct * 100);
+            fprintf(fp, "set label %d '%s' at %.3lf,%lu"
+                    " rotate by 30"
+                    " font ',%d'"
+                    " front"
+                    " point pointtype 2 lw 2"
+                    " lc rgb '%s'"
+                    " # %.1lf percentile\n",
+                    k + 1, percentilestr + len,
+                    r[0].latdatv[k].latency, r[0].latdatv[k].hits,
+                    fontsize, rcolor[1], r[0].latdatv[k].pct * 100);
+
+            len += strlen(percentilestr + len) + 1;
+            latmax = r[0].latdatv[k].latency;
         }
 
-        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 3"
-                " lc rgb '%s' front # average latency\n",
-                k + 1, r[0].latavg_latency, r[0].latavg_hits, rcolor[1]);
+        fprintf(fp, "set label %d '%s' at %.3lf,%.3lf"
+                " rotate by 30"
+                " font ',%d'"
+                " front"
+                " point pointtype 2 lw 2"
+                " lc rgb '%s'"
+                " # average read latency\n",
+                k + 1, "avg",
+                r[0].latavg_latency, r[0].latavg_hits,
+                fontsize, rcolor[1]);
 
+        //fprintf(fp, "set xrange [%lu:%.3lf]\n", r[0].first, latmax + (latmax * 3) / 100);
         fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
+        fprintf(fp, "#first %lu, latmax %.3lf\n", r[0].first, latmax);
 
-        fprintf(fp, "set autoscale y\n");
-        if (r[0].latavg_hits > 0 && r[0].peakhits > r[0].latavg_hits * 100) {
+        if (r[0].peakhits > r[0].latavg_hits * 1000) {
             fprintf(fp, "set logscale y\n");
-            fprintf(fp, "set mytics 10\n");
+            fprintf(fp, "set ylabel 'frequency (log base 10)'\n");
         } else {
             fprintf(fp, "unset logscale y\n");
+            fprintf(fp, "set ylabel 'frequency'\n");
             fprintf(fp, "set yrange [-%lu:]\n",
-                    (u_long)(r[0].peakhits * 0.05));
+                    //(u_long)(r[0].peakhits * 0.05));
+                    (u_long)(r[0].latavg_hits * 0.10));
         }
-        fprintf(fp, "#peak %lu, avg %lu\n", r[0].peakhits, r[0].latavg_hits);
+        fprintf(fp, "#peakhits %lu, latavg_hits %.3lf\n", r[0].peakhits, r[0].latavg_hits);
 
         fprintf(fp, "plot '%s.rlat' every ::1:::0 using ($1):($2) with lines"
                 " lc rgb '%s' title 'reader%s'\n",
@@ -840,58 +843,59 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
      */
     if (wjobs > 0) {
         double latmax = r[1].latmax_latency;
+        size_t len = 0;
 
+        fprintf(fp, "\n");
         fprintf(fp, "set title 'write latency' offset 0, -1\n");
         fprintf(fp, "set xtics autofreq nomirror font ',%d'\n", fontsize);
         fprintf(fp, "set autoscale xfix\n");
-
-        if (1) {
-            const char *comma = "";
-            size_t len = 0;
-
-            fprintf(fp, "set x2tics auto nomirror rotate by 30 font ',%d' (", fontsize);
-
-            for (k = 0; k < r[1].latdatc; ++k) {
-                if (r[1].latdatv[k].latency) {
-                    fprintf(fp, "%s '%s' %.3lf",
-                            comma, percentilestr + len, r[1].latdatv[k].latency);
-
-                    len += strlen(percentilestr + len) + 1;
-                    latmax = r[1].latdatv[k].latency;
-                    comma = ",";
-                }
-            }
-
-            fprintf(fp, "%s 'avg' %.3lf )\n", comma, r[1].latavg_latency);
-            fprintf(fp, "set autoscale x2fix\n");
-        }
+        fprintf(fp, "set autoscale\n");
 
         for (k = 0; k < r[1].latdatc; ++k) {
             if (!r[1].latdatv[k].latency)
                 continue;
 
-            fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 1"
-                    " lc rgb '%s' front # %.2lf percentile\n",
-                    k + 1, r[1].latdatv[k].latency, r[1].latdatv[k].hits,
-                    wcolor[1], r[1].latdatv[k].pct * 100);
+            fprintf(fp, "set label %d '%s' at %.3lf,%lu"
+                    " rotate by 30"
+                    " font ',%d'"
+                    " front"
+                    " point pointtype 2 lw 2"
+                    " lc rgb '%s'"
+                    " # %.1lf percentile\n",
+                    k + 1,
+                    percentilestr + len,
+                    r[1].latdatv[k].latency, r[1].latdatv[k].hits,
+                    fontsize, wcolor[1], r[1].latdatv[k].pct * 100);
+
+            len += strlen(percentilestr + len) + 1;
+            latmax = r[1].latdatv[k].latency;
         }
 
-        fprintf(fp, "set label %d '' at %.3lf,%lu point pointtype 3"
-                " lc rgb '%s' front # average latency\n",
-                k + 1, r[1].latavg_latency, r[1].latavg_hits, wcolor[1]);
+        fprintf(fp, "set label %d '%s' at %.3lf,%.3lf"
+                " rotate by 30"
+                " font ',%d'"
+                " front"
+                " point pointtype 2 lw 2"
+                " lc rgb '%s'"
+                " # average write latency\n",
+                k + 1, "avg",
+                r[1].latavg_latency, r[1].latavg_hits,
+                fontsize, wcolor[1]);
 
+        //fprintf(fp, "set xrange [%lu:%.3lf]\n", r[1].first, latmax + (latmax * 3) / 100);
         fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
+        fprintf(fp, "#first %lu, latmax %.3lf\n", r[1].first, latmax);
 
-        fprintf(fp, "set autoscale y\n");
-        if (r[1].latavg_hits > 0 && r[1].peakhits > r[1].latavg_hits * 100) {
+        if (r[1].peakhits > r[1].latavg_hits * 1000) {
             fprintf(fp, "set logscale y\n");
-            fprintf(fp, "set mytics 10\n");
+            fprintf(fp, "set ylabel 'frequency (log base 10)'\n");
         } else {
             fprintf(fp, "unset logscale y\n");
+            fprintf(fp, "set ylabel 'frequency'\n");
             fprintf(fp, "set yrange [-%lu:]\n",
                     (u_long)(r[1].peakhits * 0.05));
         }
-        fprintf(fp, "#peak %lu, avg %lu\n", r[1].peakhits, r[1].latavg_hits);
+        fprintf(fp, "#peakhits %lu, latavg_hits %.3lf\n", r[1].peakhits, r[1].latavg_hits);
 
         fprintf(fp, "plot '%s.wlat' every ::1:::0 using ($1):($2) with lines"
                 " lc rgb '%s' title 'writer%s'\n",
@@ -914,6 +918,7 @@ usage(void)
     printf("usage: %s [options] <device> ...\n", progname);
     printf("usage: %s -h\n", progname);
     printf("usage: %s -V\n", progname);
+    printf("-c xclip    elide xclip seconds from left and right of ops graph\n");
     printf("-d secs     specify test duration (seconds) (default: %ld)\n", duration);
     printf("-h          print this help list\n");
     printf("-l partsz   specify the max partition size to use\n");
@@ -963,6 +968,7 @@ main(int argc, char **argv)
     duration = 60;
     zrunlen = 0;
     partsz = 0;
+    xclip = 3;
 
 #if USE_CLOCK
     itv_freq = 1000000000; /* using clock_gettime() for interval measurements */
@@ -1015,7 +1021,7 @@ main(int argc, char **argv)
         char *errmsg, *end;
         int c;
 
-        c = getopt(argc, argv, ":d:hl:Mm:no:P:R:r:T:VvW:w:xz:");
+        c = getopt(argc, argv, ":c:d:hl:Mm:no:P:R:r:T:VvW:w:xz:");
         if (c == -1)
             break;
 
@@ -1023,6 +1029,13 @@ main(int argc, char **argv)
         errno = 0;
 
         switch (c) {
+        case 'c':
+            errmsg = "invalid xclip duration";
+            xclip = strtol(optarg, &end, 0);
+            if (xclip < 0)
+                xclip = 0;
+            break;
+
         case 'd':
             errmsg = "invalid test duration";
             duration = strtol(optarg, &end, 0);
@@ -1067,25 +1080,25 @@ main(int argc, char **argv)
             break;
 
         case 'm':
-            errmsg = "invalid status duration";
-            status = strtol(optarg, &end, 0);
-            if (status < 1)
-                status = 1;
+            errmsg = "invalid status mark duration";
+            mark = strtol(optarg, &end, 0);
+            if (mark < 1)
+                mark = 1;
             if (end && *end) {
                 errmsg = "invalid status time specifier";
                 switch (*end) {
                 case 'd':
-                    status *= 86400;
+                    mark *= 86400;
                     end = NULL;
                     break;
 
                 case 'h':
-                    status *= 3600;
+                    mark *= 3600;
                     end = NULL;
                     break;
 
                 case 'm':
-                    status *= 60;
+                    mark *= 60;
                     end = NULL;
                     break;
 
@@ -1190,8 +1203,10 @@ main(int argc, char **argv)
 
     if (duration < 10)
         duration = 10;
-    if (status == 0)
-        status = duration;
+    if (xclip > duration / 3)
+        xclip = duration / 3;
+    if (mark == 0)
+        mark = duration;
 
     if (help) {
         usage();
@@ -1365,6 +1380,8 @@ main(int argc, char **argv)
         fflush(stdout);
     }
 
+    /* Wait for all worker threads to become ready.
+     */
     pthread_barrier_wait(&rwbarrier);
 
     signal(SIGINT, sigint_isr);
@@ -1380,21 +1397,23 @@ main(int argc, char **argv)
         timeout.tv_sec = itv_to_usecs(itv_omega - now) / 1000000;
         timeout.tv_nsec = 0;
 
-        if (status < timeout.tv_sec) {
-            timeout.tv_sec = status - 1;
+        if (mark < timeout.tv_sec) {
+            timeout.tv_sec = mark - 1;
             timeout.tv_nsec = 1000000000 - 100000;
         }
 
         rc = ppoll(NULL, 0, &timeout, &sigset_old);
-        if (rc && errno != EINTR)
-            printf("rc %d, errno %d\n", rc, errno);
 
         if (sigint) {
             duration = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
+            if (xclip >= duration / 2)
+                xclip = 0;
             break;
         }
 
-        if (siginfo || status < duration) {
+        /* Status reporting can cause noticable drops in test r/w throughput.
+         */
+        if (siginfo || mark < duration) {
             time_t elapsed = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
             u_long ropstot = 0;
             u_long wopstot = 0;
