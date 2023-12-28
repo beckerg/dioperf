@@ -398,7 +398,7 @@ void *
 rwtest(void *arg)
 {
     struct tdargs *a = arg;
-    uint64_t partsz_mask, iosz_mask;
+    uint64_t iosz_mask;
     uint64_t itv_next;
     ssize_t iosz, cc;
     time_t elapsed;
@@ -433,19 +433,11 @@ rwtest(void *arg)
 
     memset(a->bktv, 0, a->bktvsz);
 
-    iosz_mask = ~((1ul << ilog2(a->iosz)) - 1);
-    off = (partsz / (a->tid + 1)) & iosz_mask;
-    iosz = dryrun ? 0 : a->iosz;
-
-    /* partsz_mask is used to eliminate the modulus operation
-     * otherwise needed to compute the next random offset.
-     *
-     * TODO: In random mode, if partsz is not a power of two then
-     * this will yield a non-uniform distribution (worst case, 25%
-     * of the offsets will occur 25% more frequently, right???)
+    /* Start each worker thread at a different offset.
      */
-    partsz_mask = ((2ul << ilog2(partsz)) - 1);
-    partsz_mask &= iosz_mask;
+    iosz_mask = ~((1ul << ilog2(a->iosz)) - 1);
+    off = (partsz / (rjobs + wjobs) * a->tid) & iosz_mask;
+    iosz = dryrun ? 0 : a->iosz;
 
     itv_next = itv_alpha + itv_freq;
     elapsed = 0;
@@ -486,9 +478,7 @@ rwtest(void *arg)
         ++a->opstot;
 
         if (a->random) {
-            off = xrand() & partsz_mask;
-            if (off >= partsz)
-                off -= partsz;
+            off = (xrand() % partsz) & iosz_mask;
         } else {
             off += a->iosz;
             if (off >= partsz)
@@ -1071,8 +1061,8 @@ main(int argc, char **argv)
             break;
 
         case 'l':
-            partsz = strtoul(optarg, &end, 0);
             errmsg = "invalid partition size";
+            partsz = strtol(optarg, &end, 0);
             break;
 
         case 'M':
@@ -1285,13 +1275,17 @@ main(int argc, char **argv)
             partend = end;
     }
 
-    if (partsz == 0)
-        partsz = 1ul << ilog2(partend - 1);
-
-    if (partsz > partend)
+    if (partsz < 1 || partsz > partend)
         partsz = partend;
 
-    partsz &= ~((2ul << ilog2((riosz | wiosz) - 1)) - 1);
+    /* Round down partsz to twice the larger of the read or write size
+     * so that we never issue a read or write that spans past EOF.
+     */
+    if (riosz > wiosz) {
+        partsz &= ~((2ul << ilog2(riosz - 1)) - 1);
+    } else {
+        partsz &= ~((2ul << ilog2(wiosz - 1)) - 1);
+    }
 
     if (partsz / 2 < (off_t)(riosz * rjobs) || partsz / 2 < (off_t)(wiosz * wjobs)) {
         eprint(EINVAL, "partition size too small: %ld\n", partsz);
@@ -1299,21 +1293,31 @@ main(int argc, char **argv)
     }
 
     if (use_mmap) {
-        int prot = PROT_READ | PROT_WRITE;
+        int behav = MADV_RANDOM;
         int flags = MAP_PRIVATE;
+        int prot = 0;
 
-#if __Free_BSD
+#if __FreeBSD__
         flags |= MAP_NOCORE | MAP_NOSYNC;
 #endif
+
+        if (rjobs > 0)
+            prot |= PROT_READ;
+        if (wjobs > 0)
+            prot |= PROT_WRITE;
+
+        if ((rjobs + wjobs == 1) && (rsequential || wsequential))
+            behav = MADV_SEQUENTIAL;
 
         for (i = 0; i < (u_int)argc; ++i) {
             mmapv[i] = mmap(NULL, partsz, prot, flags, fdv[i], 0);
             if (mmapv[i] == MAP_FAILED) {
-                eprint(errno, "mmap %s failed", argv[i]);
+                eprint(errno, "mmap(%lu, 0x%x, 0x%x, %d) %s failed",
+                       partsz, prot, flags, fdv[i], argv[i]);
                 exit(EX_OSERR);
             }
 
-            madvise(mmapv[i], partsz, MADV_RANDOM);
+            madvise(mmapv[i], partsz, behav);
 
             close(fdv[i]);
             fdv[i] = i;
