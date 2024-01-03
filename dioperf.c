@@ -733,8 +733,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     if (rjobs > 0) {
         fprintf(fp,
                 "'%s' every ::1:::0 using ($2):($3) with lines"
-                " lc rgb '%s' title 'readers %d, %s, %zu-bytes' %s",
-                fnops, rcolor[0], rjobs,
+                " lc rgb '%s' title '%s readers %d, %s, %zu-bytes'%s",
+                fnops, rcolor[0], ofile, rjobs,
                 rsequential ? "sequential" : "random",
                 riosz,
                 wjobs ? "," : "\n");
@@ -745,21 +745,23 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     if (wjobs > 0) {
         fprintf(fp,
                 "'%s' every ::1:::0 using ($2):($4) with lines"
-                " lc rgb '%s' title 'writers %d, %s, %zu-bytes' %s",
-                fnops, wcolor[0], wjobs,
+                " lc rgb '%s' title '%s writers %d, %s, %zu-bytes'%s",
+                fnops, wcolor[0], ofile, wjobs,
                 wsequential ? "sequential" : "random",
                 wiosz,
                 rjobs ? "," : "\n");
     }
 
+#if 0
     /* Plot combined read+write ops graph.
      */
     if (rjobs && wjobs) {
         fprintf(fp,
                 "'%s' every ::1:::0 using ($2):($5) with lines "
-                "lc rgb '#009900' title 'combined'\n",
-                fnops);
+                "lc rgb '#00ff00' title '%s combined'\n",
+                fnops, ofile);
     }
+#endif
 
     fprintf(fp, "\n");
     fprintf(fp, "set xlabel 'buckets (usecs +/- %ldns)'\n",
@@ -825,8 +827,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         fprintf(fp, "#peakhits %lu, latavg_hits %.3lf\n", r[0].peakhits, r[0].latavg_hits);
 
         fprintf(fp, "plot '%s.rlat' every ::1:::0 using ($1):($2) with lines"
-                " lc rgb '%s' title 'reader%s'\n",
-                bnfile, rcolor[0], (rjobs > 1) ? "s" : "");
+                " lc rgb '%s' title '%s reader%s'\n",
+                bnfile, rcolor[0], ofile, (rjobs > 1) ? "s" : "");
     }
 
     /* Plot write latency graph.
@@ -888,8 +890,8 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         fprintf(fp, "#peakhits %lu, latavg_hits %.3lf\n", r[1].peakhits, r[1].latavg_hits);
 
         fprintf(fp, "plot '%s.wlat' every ::1:::0 using ($1):($2) with lines"
-                " lc rgb '%s' title 'writer%s'\n",
-                bnfile, wcolor[0], (wjobs > 1) ? "s" : "");
+                " lc rgb '%s' title '%s writer%s'\n",
+                bnfile, wcolor[0], ofile, (wjobs > 1) ? "s" : "");
     }
 
     fprintf(fp, "unset multiplot\n");
@@ -908,7 +910,7 @@ usage(void)
     printf("usage: %s [options] <device> ...\n", progname);
     printf("usage: %s -h\n", progname);
     printf("usage: %s -V\n", progname);
-    printf("-c xclip    elide xclip seconds from left and right of ops graph\n");
+    printf("-c xclip    elide xclip seconds from left and right of ops graph (default: %ld)\n", xclip);
     printf("-d secs     specify test duration (seconds) (default: %ld)\n", duration);
     printf("-h          print this help list\n");
     printf("-l partsz   specify the max partition size to use\n");
@@ -1463,10 +1465,11 @@ main(int argc, char **argv)
     printf("\n");
 
     if (ofile) {
-        snprintf(bnfile, sizeof(bnfile), "%s-%s%u-%s%u-d%ld-%ld",
+        snprintf(bnfile, sizeof(bnfile),
+                 "%s-%s%u,%zu-%s%u,%zu-d%ld-%ld",
                  ofile,
-                 rsequential ? "R" : "r", rjobs,
-                 wsequential ? "W" : "w", wjobs,
+                 rsequential ? "R" : "r", rjobs, riosz,
+                 wsequential ? "W" : "w", wjobs, wiosz,
                  duration, tv_alpha.tv_sec);
     }
 
