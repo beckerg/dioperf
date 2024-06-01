@@ -62,10 +62,19 @@
 #include <bsd/string.h>
 #endif
 
+#ifndef __unused
+#define __unused            __attribute__((__unused__))
+#endif
+
+#ifdef __has_builtin
 #define HAVE_RDTSC          (__has_builtin(__builtin_ia32_rdtsc))
 #define HAVE_RDTSCP         (__has_builtin(__builtin_ia32_rdtscp))
 #define HAVE_RDRAND64       (__has_builtin(__builtin_ia32_rdrand64_step))
 #define HAVE_PAUSE          (__has_builtin(__builtin_ia32_pause))
+#else
+#define HAVE_RDTSC          (__amd64__)
+#define HAVE_PAUSE          (__amd64__)
+#endif
 
 #define HAVE_STRERROR_S     (0) // TODO: How to detect???
 
@@ -73,7 +82,11 @@
  * it's not available we'll fall back to using clock_gettime().
  */
 #ifndef USE_CLOCK
-#define USE_CLOCK           (!HAVE_RDTSC)
+#ifdef HAVE_RDTSC
+#define USE_CLOCK           (0)
+#else
+#define USE_CLOCK           (1)
+#endif
 #endif
 
 #define NELEM(_arr)         (sizeof(_arr) / sizeof((_arr)[0]))
@@ -331,11 +344,13 @@ sigint_isr(int code __unused)
     sigint = 1;
 }
 
+#ifdef SIGINFO
 void
 siginfo_isr(int code __unused)
 {
     siginfo = 1;
 }
+#endif
 
 /* On FreeBSD this "just works".  On Linux you need to set
  * vm.nr_hugepages in /etc/sysctl.conf to something adquetely
@@ -1391,7 +1406,10 @@ main(int argc, char **argv)
     pthread_barrier_wait(&rwbarrier);
 
     signal(SIGINT, sigint_isr);
+
+#ifdef SIGINFO
     signal(SIGINFO, siginfo_isr);
+#endif
 
     while (1) {
         uint64_t now = itv_cycles();
