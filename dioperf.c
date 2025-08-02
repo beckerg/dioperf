@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021,2023 Greg Becker.  All rights reserved.
+ * Copyright (c) 2021,2023,2025 Greg Becker.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -42,6 +42,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <fcntl.h>
@@ -76,7 +77,7 @@
 #define HAVE_PAUSE          (__amd64__)
 #endif
 
-#define HAVE_STRERROR_S     (0) // TODO: How to detect???
+#define HAVE_STRERROR_S     (__STDC_WANT_LIB_EXT1__)
 
 /* By default we use rdtsc() to measure timing intervals, but if
  * it's not available we'll fall back to using clock_gettime().
@@ -120,6 +121,7 @@ struct tdargs {
     bool        random;
     int         fd;
     size_t      iosz;
+    size_t      iomax;
     u_long     *opsv;
     u_long     *bktv;
     pthread_t   thr;
@@ -149,8 +151,8 @@ struct latres {
     struct latdat latdatv[16];
 };
 
-const char *wcolor[] = { "#cc0000", "#00ffff" };
-const char *rcolor[] = { "#00cccc", "#0000cc" };
+const char *wcolor[] = { "#cc0000", "#b0e09c", "#000000" };
+const char *rcolor[] = { "#00cccc", "#b0e09c", "#000000" };
 const char *term = "png";
 const char *progname;
 const char *ofile;
@@ -160,10 +162,10 @@ bool rsequential;
 bool wsequential;
 bool use_mmap;
 bool dryrun;
-size_t riosz;
-size_t wiosz;
-u_int rjobs;
-u_int wjobs;
+bool partszpct;
+u_int rjobs, wjobs;
+size_t riosz, wiosz;
+size_t riomax, wiomax;
 off_t partend;
 off_t partsz;
 size_t zrunlen;
@@ -175,11 +177,12 @@ double usecs_per_cycle;
 volatile time_t duration;
 time_t mark;
 time_t xclip;
-char bnfile[128];
+char bnfile[256];
+char cmdline[256];
 
 struct latres latresv[2];
 
-char percentilestrv[] = "10,50,90,95";
+char percentilestrv[] = "1.0,2.3,15.9,50.0,84.1,90,95,97.7,99.0";
 char *percentilestr = percentilestrv;
 double *percentilev;
 u_int percentilec;
@@ -189,6 +192,7 @@ struct tdargs *tdargsv;
 
 __thread uint64_t xrand_tls[2];
 
+atomic_int nrunning;
 
 static inline uint64_t
 rotl(const uint64_t x, int k)
@@ -336,12 +340,19 @@ syntax(const char *fmt, ...)
 }
 
 volatile sig_atomic_t sigint;
+volatile sig_atomic_t sigusr1;
 volatile sig_atomic_t siginfo;
 
 void
 sigint_isr(int code __unused)
 {
     sigint = 1;
+}
+
+void
+sigusr1_isr(int code __unused)
+{
+    sigusr1 = 1;
 }
 
 #ifdef SIGINFO
@@ -416,6 +427,7 @@ rwtest(void *arg)
     uint64_t iosz_mask;
     uint64_t itv_next;
     ssize_t iosz, cc;
+    size_t iomax;
     time_t elapsed;
     size_t iobufsz;
     void *iobuf;
@@ -456,15 +468,17 @@ rwtest(void *arg)
 
     itv_next = itv_alpha + itv_freq;
     elapsed = 0;
+    iomax = 0;
     cc = iosz;
 
     /* Wait here for the master thread to start the test.
      */
+    nrunning++;
     pthread_barrier_wait(&rwbarrier);
 
-    /* TODO: Use locking to prevent overlapped I/O...
+    /* TODO: Use locking to prevent overlapped I/O between threads...
      */
-    while (itv_next < itv_omega) {
+    while (1) {
         uint64_t tstart, tstop, dt;
 
         tstart = itv_start();
@@ -477,7 +491,7 @@ rwtest(void *arg)
 
         if (unlikely( tstop >= itv_next )) {
             elapsed = itv_to_usecs(tstop - itv_alpha) / 1000000;
-            if (elapsed >= duration)
+            if (elapsed > duration)
                 break;
 
             itv_next = itv_alpha + (elapsed * itv_freq) + itv_freq;
@@ -488,15 +502,19 @@ rwtest(void *arg)
         if (dt > BKT_MAX - 1)
             dt = BKT_MAX - 1;
 
-        ++a->opsv[elapsed];
-        ++a->bktv[dt];
-        ++a->opstot;
+        a->opsv[elapsed]++;
+        a->bktv[dt]++;
+        a->opstot++;
+
+        iomax += iosz;
+        if (iomax >= a->iomax)
+            break;
 
         if (a->random) {
             off = (xrand() % partsz) & iosz_mask;
         } else {
-            off += a->iosz;
-            if (off >= partsz)
+            off += iosz;
+            if (off > partsz - iosz)
                 off = 0;
         }
     }
@@ -510,6 +528,12 @@ rwtest(void *arg)
     }
 
     free(iobuf);
+
+    /* Decrement the count of running worker threads,
+     * then wake up the main thread.
+     */
+    nrunning--;
+    kill(0, SIGUSR1);
 
     pthread_exit(NULL);
 }
@@ -632,6 +656,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 {
     char fnops[256], fnplot[256];
     char buf[128 + jobs * 16];
+    u_long opsavg, ops0;
     int xtics, mxtics;
     u_int j, k;
     FILE *fp;
@@ -639,6 +664,14 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
 
     if (!ofile)
         return;
+
+    opsavg = 0;
+    ops0 = 0;
+    for (j = 0; j < jobs; ++j) {
+        opsavg += a[j].opstot;
+        ops0 += a[j].opsv[0];
+    }
+    opsavg = (opsavg * 1000000ul) / a->usecs;
 
     /* Create a file and write out all the time series data.
      */
@@ -657,7 +690,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         fprintf(fp, " %6u%s", j, (j < rjobs) ? "r" : "w");
     fprintf(fp, "\n");
 
-    for (i = 0; i < duration; ++i) {
+    for (i = 0; i < duration + 1; ++i) {
         u_long rops = 0, wops = 0;
         size_t pos = 0;
         int n;
@@ -715,19 +748,21 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     }
 
     fprintf(fp, "# Created on %s", ctime(&t0));
+    fprintf(fp, "# %s\n", cmdline);
 
+    fprintf(fp, "\n");
     fprintf(fp, "set output '%s.%s'\n", bnfile, term);
-    fprintf(fp, "set term %s size 2048,1152\n", term);
+    fprintf(fp, "set term %s size 2560,1152\n", term);
     //fprintf(fp, "set size 1, 0.76\n");
     //fprintf(fp, "set origin 0, 0.24\n");
     fprintf(fp, "set autoscale\n");
     fprintf(fp, "set grid\n");
 
-    fprintf(fp, "set multiplot layout %d,1 columnsfirst\n",
-            rjobs && wjobs ? 3 : 2);
+    fprintf(fp, "set multiplot layout %d,1 title '%s' columnsfirst\n",
+            rjobs && wjobs ? 3 : 2, cmdline);
 
     fprintf(fp, "\n");
-    fprintf(fp, "set title '%s operations' offset 0, -1\n",
+    fprintf(fp, "set title '%s operations' offset 0, -2.5\n",
             rjobs && wjobs ? "r/w" : (rjobs ? "read" : "write"));
 
     fprintf(fp, "set xlabel 'seconds'\n");
@@ -736,10 +771,13 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     fprintf(fp, "set mxtics %d\n", mxtics);
     fprintf(fp, "set xrange [%ld:%ld]\n", xclip, duration - xclip);
 
-    fprintf(fp, "set ylabel '%s operations per second'\n",
+    fprintf(fp, "set ylabel '%s operations per second' offset 1,0\n",
             rjobs && wjobs ? "r/w" : (rjobs ? "read" : "write"));
     fprintf(fp, "set ytics autofreq font ',%d'\n", fontsize);
     fprintf(fp, "set mytics 2\n");
+
+    if (ops0 < opsavg && (rjobs == 0 || wjobs == 0))
+        fprintf(fp, "set yrange [%ld:]\n", ops0);
 
     fprintf(fp, "plot ");
 
@@ -747,7 +785,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
      */
     if (rjobs > 0) {
         fprintf(fp,
-                "'%s' every ::1:::0 using ($2):($3) with lines"
+                "'%s' using ($2):($3) with lines"
                 " lc rgb '%s' title '%s readers %d, %s, %zu-bytes'%s",
                 fnops, rcolor[0], ofile, rjobs,
                 rsequential ? "sequential" : "random",
@@ -759,7 +797,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
      */
     if (wjobs > 0) {
         fprintf(fp,
-                "'%s' every ::1:::0 using ($2):($4) with lines"
+                "'%s' using ($2):($4) with lines"
                 " lc rgb '%s' title '%s writers %d, %s, %zu-bytes'%s",
                 fnops, wcolor[0], ofile, wjobs,
                 wsequential ? "sequential" : "random",
@@ -772,7 +810,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
      */
     if (rjobs && wjobs) {
         fprintf(fp,
-                "'%s' every ::1:::0 using ($2):($5) with lines "
+                "'%s' using ($2):($5) with lines "
                 "lc rgb '#00ff00' title '%s combined'\n",
                 fnops, ofile);
     }
@@ -790,7 +828,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         size_t len = 0;
 
         fprintf(fp, "\n");
-        fprintf(fp, "set title 'read latency' offset 0, -1\n");
+        fprintf(fp, "set title 'read latency' offset 0, -2.5\n");
         fprintf(fp, "set xtics auto nomirror font ',%d'\n", fontsize);
         fprintf(fp, "set autoscale xfix\n");
         fprintf(fp, "set autoscale\n");
@@ -808,7 +846,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                     " # %.1lf percentile\n",
                     k + 1, percentilestr + len,
                     r[0].latdatv[k].latency, r[0].latdatv[k].hits,
-                    fontsize, rcolor[1], r[0].latdatv[k].pct * 100);
+                    fontsize, rcolor[2], r[0].latdatv[k].pct * 100);
 
             len += strlen(percentilestr + len) + 1;
             latmax = r[0].latdatv[k].latency;
@@ -823,27 +861,31 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                 " # average read latency\n",
                 k + 1, "avg",
                 r[0].latavg_latency, r[0].latavg_hits,
-                fontsize, rcolor[1]);
+                fontsize, rcolor[2]);
 
-        //fprintf(fp, "set xrange [%lu:%.3lf]\n", r[0].first, latmax + (latmax * 3) / 100);
-        fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
+        fprintf(fp, "set xrange [%.3lf:%.3lf]\n",
+                r->latdatv[0].latency * 0.987, latmax * 1.013);
         fprintf(fp, "#first %lu, latmax %.3lf\n", r[0].first, latmax);
+        fprintf(fp, "#latdatv[0] %.3lf, latmax %.3lf\n", r->latdatv[0].latency, latmax);
 
         if (r[0].peakhits > r[0].latavg_hits * 1000) {
             fprintf(fp, "set logscale y\n");
-            fprintf(fp, "set ylabel 'frequency (log base 10)'\n");
+            fprintf(fp, "set ylabel 'frequency (log base 10)' offset 1,0\n");
         } else {
             fprintf(fp, "unset logscale y\n");
-            fprintf(fp, "set ylabel 'frequency'\n");
+            fprintf(fp, "set ylabel 'frequency' offset 1,0\n");
             fprintf(fp, "set yrange [-%lu:]\n",
                     //(u_long)(r[0].peakhits * 0.05));
                     (u_long)(r[0].latavg_hits * 0.10));
         }
         fprintf(fp, "#peakhits %lu, latavg_hits %.3lf\n", r[0].peakhits, r[0].latavg_hits);
 
-        fprintf(fp, "plot '%s.rlat' every ::1:::0 using ($1):($2) with lines"
+        fprintf(fp, "plot '%s.rlat' using ($1):($2) with points"
+                " pointsize %d"
                 " lc rgb '%s' title '%s reader%s'\n",
-                bnfile, rcolor[0], ofile, (rjobs > 1) ? "s" : "");
+                bnfile,
+                1,
+                rcolor[1], ofile, (rjobs > 1) ? "s" : "");
     }
 
     /* Plot write latency graph.
@@ -853,7 +895,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
         size_t len = 0;
 
         fprintf(fp, "\n");
-        fprintf(fp, "set title 'write latency' offset 0, -1\n");
+        fprintf(fp, "set title 'write latency' offset 0, -2.5\n");
         fprintf(fp, "set xtics autofreq nomirror font ',%d'\n", fontsize);
         fprintf(fp, "set autoscale xfix\n");
         fprintf(fp, "set autoscale\n");
@@ -872,7 +914,7 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                     k + 1,
                     percentilestr + len,
                     r[1].latdatv[k].latency, r[1].latdatv[k].hits,
-                    fontsize, wcolor[1], r[1].latdatv[k].pct * 100);
+                    fontsize, wcolor[2], r[1].latdatv[k].pct * 100);
 
             len += strlen(percentilestr + len) + 1;
             latmax = r[1].latdatv[k].latency;
@@ -887,26 +929,29 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
                 " # average write latency\n",
                 k + 1, "avg",
                 r[1].latavg_latency, r[1].latavg_hits,
-                fontsize, wcolor[1]);
+                fontsize, wcolor[2]);
 
-        //fprintf(fp, "set xrange [%lu:%.3lf]\n", r[1].first, latmax + (latmax * 3) / 100);
-        fprintf(fp, "set xrange [:%.3lf]\n", latmax + (latmax * 3) / 100);
+        fprintf(fp, "set xrange [%.3lf:%.3lf]\n",
+                r[1].first - r[1].first * 0.03, latmax * 1.03);
         fprintf(fp, "#first %lu, latmax %.3lf\n", r[1].first, latmax);
 
         if (r[1].peakhits > r[1].latavg_hits * 1000) {
             fprintf(fp, "set logscale y\n");
-            fprintf(fp, "set ylabel 'frequency (log base 10)'\n");
+            fprintf(fp, "set ylabel 'frequency (log base 10)' offset 1,0\n");
         } else {
             fprintf(fp, "unset logscale y\n");
-            fprintf(fp, "set ylabel 'frequency'\n");
+            fprintf(fp, "set ylabel 'frequency' offset 1,0\n");
             fprintf(fp, "set yrange [-%lu:]\n",
                     (u_long)(r[1].peakhits * 0.05));
         }
         fprintf(fp, "#peakhits %lu, latavg_hits %.3lf\n", r[1].peakhits, r[1].latavg_hits);
 
-        fprintf(fp, "plot '%s.wlat' every ::1:::0 using ($1):($2) with lines"
+        fprintf(fp, "plot '%s.wlat' using ($1):($2) with points"
+                " pointsize %d"
                 " lc rgb '%s' title '%s writer%s'\n",
-                bnfile, wcolor[0], ofile, (wjobs > 1) ? "s" : "");
+                bnfile,
+                1,
+                wcolor[1], ofile, (wjobs > 1) ? "s" : "");
     }
 
     fprintf(fp, "unset multiplot\n");
@@ -925,28 +970,36 @@ usage(void)
     printf("usage: %s [options] <device> ...\n", progname);
     printf("usage: %s -h\n", progname);
     printf("usage: %s -V\n", progname);
-    printf("-c xclip    elide xclip seconds from left and right of ops graph (default: %ld)\n", xclip);
-    printf("-d secs     specify test duration (seconds) (default: %ld)\n", duration);
+    printf("-c xclip    elide xclip seconds from left and right of ops graph (default: %ld)\n",
+           xclip);
+    printf("-d secs     test duration (seconds) (default: %ld)\n", duration);
     printf("-h          print this help list\n");
-    printf("-l partsz   specify the max partition size to use\n");
+    printf("-l partsz   the max partition size or percentage to r/w (default: 100%%)\n");
     printf("-M          use mmap rather than pread/pwrite\n");
     printf("-m mark     print status every mark seconds\n");
     printf("-n          dry run (i.e., issue zero-length reads/writes)\n");
-    printf("-o prefix   specify output file name prefix\n");
-    printf("-P pctlist  specify a list of percentiles (default: %s)\n", percentilestr);
-    printf("-R rdargs   sequential I/O reader thread args\n");
-    printf("-r rdargs   random I/O reader thread args\n");
-    printf("-T term     specify gnuplot term type (default: %s)\n", term);
+    printf("-o prefix   output file name prefix\n");
+    printf("-P pctlist  list of percentiles to annotate (default: %s)\n", percentilestr);
+    printf("-R rdargs   sequential I/O reader thread args (default: %u,%zu)\n",
+           rsequential ? rjobs : 0, riosz);
+    printf("-r rdargs   random I/O reader thread args (default: %u,%zu)\n",
+           rsequential ? 0 : rjobs, riosz);
+    printf("-T term     gnuplot term type (default: %s)\n", term);
     printf("-V          show version\n");
     printf("-v          increase verbosity\n");
-    printf("-W rdargs   sequential I/O writer thread args\n");
-    printf("-w rdargs   random I/O writer thread args\n");
+    printf("-W wrargs   sequential I/O writer thread args (default: %u,%zu)\n",
+           wsequential ? wjobs : 0, wiosz);
+    printf("-w wrargs   random I/O writer thread args (default: %u,%zu\n",
+           wsequential ? 0 : wjobs, wiosz);
     printf("-x          disable direct IO\n");
     printf("-z runlen   run length of repeated write data bytes\n");
     printf("\n");
+
+    printf("partsz    bytes[bkgmt] | percent%%\n");
+    printf("rdargs    rdjobs[,rdsize[,rdmax]]\n");
+    printf("wrargs    wrjobs[,wrsize[,wrmax]]\n");
     printf("<device>  device or file name to test\n");
-    printf("rdargs    rdjobs[,rdsize] (default: %u,%zu)\n", rjobs, riosz);
-    printf("wrargs    wrjobs[,wrsize] (default: %u,%zu)\n", wjobs, wiosz);
+    printf("\n");
 }
 
 int
@@ -962,9 +1015,16 @@ main(int argc, char **argv)
     progname = strrchr(argv[0], '/');
     progname = progname ? progname + 1 : argv[0];
 
+    for (int k = 0; k < argc; ++k) {
+        if (k > 0)
+            strcat(cmdline, " ");
+        strcat(cmdline, argv[k]);
+    }
+
     xrand_init(itv_start());
 
     directio = O_DIRECT;
+    riomax = wiomax = SIZE_T_MAX;
     riosz = wiosz = 4096;
     rjobs = wjobs = 0;
     partend = OFF_MAX;
@@ -972,10 +1032,10 @@ main(int argc, char **argv)
     version = false;
     dryrun = false;
     help = false;
-    duration = 60;
+    duration = 300;
     zrunlen = 0;
     partsz = 0;
-    xclip = 3;
+    xclip = 0;
 
 #if USE_CLOCK
     itv_freq = 1000000000; /* using clock_gettime() for interval measurements */
@@ -1080,6 +1140,51 @@ main(int argc, char **argv)
         case 'l':
             errmsg = "invalid partition size";
             partsz = strtol(optarg, &end, 0);
+            if (partsz < 1) {
+                errno = EINVAL;
+                break;
+            }
+
+            if (end && *end) {
+                errmsg = "invalid partition size specifier";
+                switch (*end) {
+                case '%':
+                    if (partsz > 0 && partsz <= 100) {
+                        partszpct = true;
+                        end = NULL;
+                    } else {
+                        errno = EINVAL;
+                    }
+                    break;
+
+                case 'B':
+                case 'b':
+                    end = NULL;
+                    break;
+
+                case 'G':
+                case 'g':
+                    partsz = partsz << 30;
+                    end = NULL;
+                    break;
+
+                case 'M':
+                case 'm':
+                    partsz = partsz << 20;
+                    end = NULL;
+                    break;
+
+                case 'T':
+                case 't':
+                    partsz = partsz << 40;
+                    end = NULL;
+                    break;
+
+                default:
+                    errno = EINVAL;
+                    break;
+                }
+            }
             break;
 
         case 'M':
@@ -1139,7 +1244,7 @@ main(int argc, char **argv)
                 errmsg = "invalid read I/O size";
                 riosz = strtoul(end + 1, &end, 0);
                 if (strpbrk(end, delim)) {
-                    rcolor[0] = end + 1;
+                    riomax = strtoul(end + 1, &end, 0);
                     end = NULL;
                 }
             }
@@ -1168,7 +1273,7 @@ main(int argc, char **argv)
                 errmsg = "invalid write I/O size";
                 wiosz = strtoul(end + 1, &end, 0);
                 if (strpbrk(end, delim)) {
-                    wcolor[0] = end + 1;
+                    wiomax = strtoul(end + 1, &end, 0);
                     end = NULL;
                 }
             }
@@ -1292,7 +1397,9 @@ main(int argc, char **argv)
             partend = end;
     }
 
-    if (partsz < 1 || partsz > partend)
+    if (partszpct) {
+        partsz = (partend * partsz) / 100.0;
+    } else if (partsz < 1 || partsz > partend)
         partsz = partend;
 
     /* Round down partsz to twice the larger of the read or write size
@@ -1367,14 +1474,16 @@ main(int argc, char **argv)
         if (j < rjobs) {
             a->rwfunc = use_mmap ? mmap_pread : pread;
             a->iosz = riosz;
+            a->iomax = riomax;
             a->random = !rsequential;
         } else {
             a->rwfunc = use_mmap ? mmap_pwrite : (rwfunc_t *)pwrite;
             a->iosz = wiosz;
+            a->iomax = wiomax;
             a->random = !wsequential;
         }
 
-        a->bktvsz = roundup(sizeof(*a->bktv) * (BKT_MAX + duration + 1), 4096);
+        a->bktvsz = roundup(sizeof(*a->bktv) * (BKT_MAX + duration + 3), 4096);
 
         a->bktv = super_alloc(a->bktvsz);
         if (!a->bktv)
@@ -1391,7 +1500,7 @@ main(int argc, char **argv)
 
     gettimeofday(&tv_alpha, NULL);
     itv_alpha = itv_start();
-    itv_omega = itv_alpha + itv_freq * duration;
+    itv_omega = itv_alpha + itv_freq * (duration + 1);
 
     if (verbosity > 0) {
         printf("testing: %ld of %ld MiB (%.2lf%%), %u readers, %u writers\n",
@@ -1406,12 +1515,13 @@ main(int argc, char **argv)
     pthread_barrier_wait(&rwbarrier);
 
     signal(SIGINT, sigint_isr);
+    signal(SIGUSR1, sigusr1_isr);
 
 #ifdef SIGINFO
     signal(SIGINFO, siginfo_isr);
 #endif
 
-    while (1) {
+    while (nrunning > 0) {
         uint64_t now = itv_cycles();
         struct timespec timeout;
 
@@ -1428,12 +1538,11 @@ main(int argc, char **argv)
 
         rc = ppoll(NULL, 0, &timeout, &sigset_old);
 
-        if (sigint) {
-            duration = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
-            if (xclip >= duration / 2)
-                xclip = 0;
+        if (sigint)
             break;
-        }
+
+        if (sigusr1)
+            sigusr1 = 0;
 
         /* Status reporting can cause noticable drops in test r/w throughput.
          */
@@ -1474,21 +1583,33 @@ main(int argc, char **argv)
     }
 
     itv_omega = itv_stop();
+    duration = itv_to_usecs(itv_omega - itv_alpha) / 1000000;
+    //duration = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
+    if (xclip >= duration / 2)
+        xclip = 0;
 
     printf("%12.3lf  total test time (seconds)\n",
            itv_to_usecs(itv_omega - itv_alpha) / 1000000);
-    printf("%12ld  partition size (MiB)\n", partend >> 20);
-    printf("%12ld  partition used (MiB)\n", partsz >> 20);
-    printf("%12lu  itv_freq\n", itv_freq);
+
+    printf("%12ld  partition size (MiB)\n",
+           partend >> 20);
+
+    printf("%12ld  partition used (MiB, %.0lf%%)\n",
+           partsz >> 20,
+           partsz * 100.0 / partend);
+
+    printf("%12lu  interval timer frequency\n", itv_freq);
     printf("\n");
 
     if (ofile) {
         snprintf(bnfile, sizeof(bnfile),
-                 "%s-%s%u,%zu-%s%u,%zu-d%ld-%ld",
+                 "%s-%s%u,%zu-%s%u,%zu-d%ld-l%.0lf%%-%ld",
                  ofile,
                  rsequential ? "R" : "r", rjobs, riosz,
                  wsequential ? "W" : "w", wjobs, wiosz,
-                 duration, tv_alpha.tv_sec);
+                 duration,
+                 partsz * 100.0 / partend,
+                 tv_alpha.tv_sec);
     }
 
     memset(latresv, 0, sizeof(latresv));

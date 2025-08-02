@@ -12,6 +12,7 @@ PROGUC   := $(shell echo -n ${PROG} | tr 'a-z' 'A-Z')
 
 INCLUDE  := -I. -I../lib -I../../src/include
 CDEFS    := -D${PROGUC}_VERSION=\"${VERSION}\" -DNDEBUG
+#CDEFS    += -DUSE_CLOCK
 
 LDLIBS   := -lpthread
 
