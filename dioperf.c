@@ -433,7 +433,7 @@ rwtest(void *arg)
     void *iobuf;
     off_t off;
 
-    xrand_init(rotl(itv_start(), a->tid % 64));
+    xrand_init(rotl(itv_start(), (a->tid % 64) + 1));
 
     iobufsz = roundup(a->iosz, 4096);
     iobuf = aligned_alloc(4096, iobufsz);
@@ -478,7 +478,7 @@ rwtest(void *arg)
 
     /* TODO: Use locking to prevent overlapped I/O between threads...
      */
-    while (1) {
+    while (!sigint) {
         uint64_t tstart, tstop, dt;
 
         tstart = itv_start();
@@ -1468,6 +1468,7 @@ main(int argc, char **argv)
     for (j = 0; j < rjobs + wjobs; ++j) {
         struct tdargs *a = tdargsv + j;
 
+        memset(a, 0, sizeof(*a));
         a->tid = j;
         a->fd = fdv[j % argc];
 

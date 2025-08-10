@@ -1,4 +1,4 @@
-# Copyright (c) 2021 Greg Becker.  All rights reserved.
+# Copyright (c) 2021,2025 Greg Becker.  All rights reserved.
 
 PROG := dioperf
 
@@ -11,19 +11,17 @@ VERSION  := $(shell git describe --abbrev=10 --dirty --always --tags)
 PROGUC   := $(shell echo -n ${PROG} | tr 'a-z' 'A-Z')
 
 INCLUDE  := -I. -I../lib -I../../src/include
-CDEFS    := -D${PROGUC}_VERSION=\"${VERSION}\" -DNDEBUG
-#CDEFS    += -DUSE_CLOCK
+CPPFLAGS := -D${PROGUC}_VERSION=\"${VERSION}\" -DNDEBUG
+#CPPFLAGS += -DUSE_CLOCK
 
 LDLIBS   := -lpthread
 
 ifeq (${PLATFORM},linux)
-CDEFS    += -D_GNU_SOURCE
+CPPFLAGS += -D_GNU_SOURCE
 LDLIBS   += -lbsd
 endif
 
-CFLAGS   += -Wall -Wextra -g -O2 ${INCLUDE}
-DEBUG    := -O0 -UNDEBUG -fno-omit-frame-pointer
-CPPFLAGS := ${CDEFS}
+CFLAGS   += -Wall -Wextra -O2 ${INCLUDE}
 
 # Always delete partially built targets.
 #
@@ -34,9 +32,10 @@ CPPFLAGS := ${CDEFS}
 
 all: ${PROG}
 
-asan: CFLAGS += ${DEBUG}
+asan: CFLAGS += -O0 -g3 -fno-omit-frame-pointer
 asan: CFLAGS += -fsanitize=address -fsanitize=undefined
 asan: LDLIBS += -fsanitize=address -fsanitize=undefined
+asan: CPPFLAGS += -UNDEBUG
 asan: ${PROG}
 
 clean:
@@ -45,7 +44,8 @@ clean:
 
 cleandir clobber distclean: clean
 
-debug: CFLAGS += ${DEBUG}
+debug: CFLAGS += -O0 -g3 -fno-omit-frame-pointer
+debug: CPPFLAGS += -UNDEBUG
 debug: ${PROG}
 
 native: CFLAGS += -march=native -flto
@@ -54,8 +54,6 @@ native: ${PROG}
 # Use gmake's link rule to produce the target.
 #
 ${PROG}: ${OBJ}
-	$(LINK.o) $^ $(LOADLIBES) $(LDLIBS) -o $@
-
 
 # We make ${OBJ} depend on the GNUmakefile so that all objects are rebuilt
 # if the makefile changes.
