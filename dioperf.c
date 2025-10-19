@@ -363,10 +363,12 @@ siginfo_isr(int code __unused)
 }
 #endif
 
-/* On FreeBSD this "just works".  On Linux you need to set
- * vm.nr_hugepages in /etc/sysctl.conf to something adquetely
- * large in order for this to allocate superpages.  Or maybe
- * use transparent huge pages (THP), or hugetblfs.  Yuk...
+/* Try to allocate one or more super pages (i.e., 2M pages
+ * aligned on a 2M boundary).  On FreeBSD this might "just
+ * work", but on Linux you need to set vm.nr_hugepages in
+ * /etc/sysctl.conf to something adquately large in order
+ * for this to allocate superpages.  Or maybe use
+ * transparent huge pages (THP), or hugetblfs.  Ugh...
  */
 void *
 super_alloc(size_t sz)
@@ -393,15 +395,18 @@ super_alloc(size_t sz)
         }
 
         eprint(errno, "mmap(%zu, %x, %x) failed", sz, prot, flags);
+        return NULL;
     }
 
     return mem;
 }
 
 int
-super_free(void *addr, size_t len)
+super_free(void *addr, size_t sz)
 {
-    return munmap(addr, len);
+    sz = (sz + (2u << 20) - 1) & ~((2u << 20) - 1);
+
+    return munmap(addr, sz);
 }
 
 ssize_t
@@ -1501,7 +1506,7 @@ main(int argc, char **argv)
 
     gettimeofday(&tv_alpha, NULL);
     itv_alpha = itv_start();
-    itv_omega = itv_alpha + itv_freq * (duration + 1);
+    itv_omega = itv_alpha + itv_freq * duration + itv_freq / 2;
 
     if (verbosity > 0) {
         printf("testing: %ld of %ld MiB (%.2lf%%), %u readers, %u writers\n",
@@ -1572,6 +1577,15 @@ main(int argc, char **argv)
         }
     }
 
+    size_t duration_orig = duration;
+
+    /* At this point all threads should have exited their r/w loop
+     * so we can now obtain a reasonably accurate test stop time
+     * (except in the case of SIGINT in which we don't care).
+     */
+    itv_omega = itv_stop();
+    duration = itv_to_usecs(itv_omega - itv_alpha) / 1000000;
+
     for (j = 0; j < rjobs + wjobs; ++j) {
         struct tdargs *a = tdargsv + j;
         void *val;
@@ -1583,14 +1597,11 @@ main(int argc, char **argv)
         }
     }
 
-    itv_omega = itv_stop();
-    duration = itv_to_usecs(itv_omega - itv_alpha) / 1000000;
-    //duration = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
     if (xclip >= duration / 2)
         xclip = 0;
 
     printf("%12.3lf  total test time (seconds)\n",
-           itv_to_usecs(itv_omega - itv_alpha) / 1000000);
+           itv_to_usecs(itv_omega - itv_alpha) / 1000000.0);
 
     printf("%12ld  partition size (MiB)\n",
            partend >> 20);
@@ -1608,7 +1619,7 @@ main(int argc, char **argv)
                  ofile,
                  rsequential ? "R" : "r", rjobs, riosz,
                  wsequential ? "W" : "w", wjobs, wiosz,
-                 duration,
+                 duration_orig,
                  partsz * 100.0 / partend,
                  tv_alpha.tv_sec);
     }
