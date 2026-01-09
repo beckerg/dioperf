@@ -179,6 +179,7 @@ time_t mark;
 time_t xclip;
 char bnfile[256];
 char cmdline[256];
+bool given[256];
 
 struct latres latresv[2];
 
@@ -465,9 +466,13 @@ rwtest(void *arg)
 
     memset(a->bktv, 0, a->bktvsz);
 
-    /* Start each worker thread at a different offset.
+    /* The I/O size mask is used to align the starting offset of
+     * every r/w operation to the power-of-two of the I/O size.
      */
     iosz_mask = ~((1ul << ilog2(a->iosz)) - 1);
+
+    /* Start each worker thread at a different offset.
+     */
     off = (partsz / (rjobs + wjobs) * a->tid) & iosz_mask;
     iosz = dryrun ? 0 : a->iosz;
 
@@ -969,6 +974,84 @@ report_ops(struct tdargs *a, u_int jobs, struct latres *r, time_t t0)
     }
 }
 
+struct clp_suftab {
+    const char *list;
+    double mult[];
+};
+
+struct clp_suftab suftab_combo = {
+    .list = "kmgtpezyKMGTPEZYbw",
+    .mult = {
+        0x1p10, 0x1p20, 0x1p30, 0x1p40, 0x1p50, 0x1p60, 0x1p70, 0x1p80,
+        1e3, 1e6, 1e9, 1e12, 1e15, 1e18, 1e21, 1e24,
+        512, sizeof(int)
+    }
+};
+
+u_int
+cvt_rwargs(const char *args, char **endp, char **errmsgp,
+           size_t *ioszp, size_t *iomaxp)
+{
+    const struct clp_suftab *suftab = &suftab_combo;
+    const char *delim = ",:";
+    u_int jobs;
+
+    *errmsgp = "invalid jobs";
+    errno = 0;
+
+    jobs = strtoul(args, endp, 0);
+    if (errno)
+        return 0;
+
+    if (strpbrk(*endp, delim)) {
+        (*endp)++;
+        if (!**endp)
+            return 0;
+
+        *errmsgp = "invalid I/O size";
+        errno = 0;
+
+        *ioszp = strtoul(*endp, endp, 0);
+        if (errno)
+            return 0;
+
+        if (*endp && **endp) {
+            const char *pc;
+
+            pc = strchr(suftab->list, **endp);
+            if (pc) {
+                *ioszp *= *(suftab->mult + (pc - suftab->list));
+                (*endp)++;
+            }
+        }
+
+        if (strpbrk(*endp, delim)) {
+            (*endp)++;
+            if (!**endp)
+                return 0;
+
+            *errmsgp = "invalid I/O max size";
+            errno = 0;
+
+            *iomaxp = strtoul(*endp, endp, 0);
+            if (errno)
+                return 0;
+
+            if (*endp && **endp) {
+                const char *pc;
+
+                pc = strchr(suftab->list, **endp);
+                if (pc) {
+                    *iomaxp *= *(suftab->mult + (pc - suftab->list));
+                    (*endp)++;
+                }
+            }
+        }
+    }
+
+    return jobs;
+}
+
 void
 usage(void)
 {
@@ -1005,6 +1088,9 @@ usage(void)
     printf("wrargs    wrjobs[,wrsize[,wrmax]]\n");
     printf("<device>  device or file name to test\n");
     printf("\n");
+    printf("For {rd|wr}size and {rd|wr}max:\n");
+    printf("  Use lowercase suffixes 'kmgtpezy' for powers-of-two,\n");
+    printf("  and uppercase suffixes 'KMGTPEZY' for powers-of-ten\n");
 }
 
 int
@@ -1089,7 +1175,6 @@ main(int argc, char **argv)
     usecs_per_cycle = 1000000.0 / itv_freq;
 
     while (1) {
-        const char *delim = ",:: ";
         char *errmsg, *end;
         int c;
 
@@ -1098,6 +1183,7 @@ main(int argc, char **argv)
             break;
 
         errmsg = end = NULL;
+        given[c] = true;
         errno = 0;
 
         switch (c) {
@@ -1243,16 +1329,7 @@ main(int argc, char **argv)
             /* FALLTHROUGH */
 
         case 'r':
-            errmsg = "invalid read jobs";
-            rjobs = strtoul(optarg, &end, 0);
-            if (strpbrk(end, delim)) {
-                errmsg = "invalid read I/O size";
-                riosz = strtoul(end + 1, &end, 0);
-                if (strpbrk(end, delim)) {
-                    riomax = strtoul(end + 1, &end, 0);
-                    end = NULL;
-                }
-            }
+            rjobs = cvt_rwargs(optarg, &end, &errmsg, &riosz, &riomax);
             break;
 
         case 'T':
@@ -1272,16 +1349,7 @@ main(int argc, char **argv)
             /* FALLTHROUGH */
 
         case 'w':
-            errmsg = "invalid write jobs";
-            wjobs = strtoul(optarg, &end, 0);
-            if (strpbrk(end, delim)) {
-                errmsg = "invalid write I/O size";
-                wiosz = strtoul(end + 1, &end, 0);
-                if (strpbrk(end, delim)) {
-                    wiomax = strtoul(end + 1, &end, 0);
-                    end = NULL;
-                }
-            }
+            wjobs = cvt_rwargs(optarg, &end, &errmsg, &wiosz, &wiomax);
             break;
 
         case 'x':
@@ -1289,8 +1357,8 @@ main(int argc, char **argv)
             break;
 
         case 'z':
-            zrunlen = strtoul(optarg, &end, 0);
             errmsg = "invalid run length";
+            zrunlen = strtoul(optarg, &end, 0);
             break;
 
         case ':':
@@ -1318,11 +1386,17 @@ main(int argc, char **argv)
     if (rjobs < 1 && wjobs < 1)
         rjobs = 1;
 
+    if (riomax != SIZE_T_MAX || wiomax != SIZE_T_MAX) {
+        if (!given['d']) {
+            duration = 86400;
+        }
+    }
+
     if (duration < 10)
         duration = 10;
     if (xclip > duration / 3)
         xclip = duration / 3;
-    if (mark == 0)
+    if (mark < 1)
         mark = duration;
 
     if (help) {
@@ -1553,6 +1627,7 @@ main(int argc, char **argv)
         /* Status reporting can cause noticable drops in test r/w throughput.
          */
         if (siginfo || mark < duration) {
+            static u_long reports = 0;
             time_t elapsed = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
             u_long ropstot = 0;
             u_long wopstot = 0;
@@ -1567,11 +1642,18 @@ main(int argc, char **argv)
                 }
             }
 
-            printf("elapsed %3ld, remaining %3ld, rbytes %zu, wbytes %zu, "
-                   "ravgKB/s %zu, wavgKB/s %zu\n",
+            if (reports++ % 16 == 0) {
+                printf("%9s %9s %10s %15s %10s %10s %15s %10s\n",
+                       "elapsed", "remaining",
+                       "rops", "rbytes", "kr/s",
+                       "wops", "wbytes", "kw/s");
+            }
+
+            printf("%9ld %9ld %10zu %15zu %10zu %10zu %15zu %10zu\n",
                    elapsed, duration - elapsed,
-                   ropstot * riosz, wopstot * wiosz,
+                   ropstot, ropstot * riosz,
                    (ropstot * riosz / elapsed) >> 10,
+                   wopstot, wopstot * wiosz,
                    (wopstot * wiosz / elapsed) >> 10);
             siginfo = 0;
         }
@@ -1614,13 +1696,59 @@ main(int argc, char **argv)
     printf("\n");
 
     if (ofile) {
+        char partszbuf[128], durbuf[128];
+        char rdargs[128], wrargs[128];
+        int n;
+
+        partszbuf[0] = '\000';
+        durbuf[0] = '\000';
+        rdargs[0] = '\000';
+        wrargs[0] = '\000';
+
+        if (given['R'] || given['r']) {
+            n = snprintf(rdargs, sizeof(rdargs), "-%s%u",
+                         rsequential ? "R" : "r", rjobs);
+
+            if (riosz != 4096 || riomax != SIZE_T_MAX) {
+                n += snprintf(rdargs + n, sizeof(rdargs) - n, ",%zu", riosz);
+
+                if (riomax != SIZE_T_MAX) {
+                    snprintf(rdargs + n, sizeof(rdargs) - n, ",%zu", riomax);
+                }
+            }
+        }
+
+        if (given['W'] || given['w']) {
+            n = snprintf(wrargs, sizeof(wrargs), "-%s%u",
+                         wsequential ? "W" : "w", wjobs);
+
+            if (wiosz != 4096 || wiomax != SIZE_T_MAX) {
+                n += snprintf(wrargs + n, sizeof(wrargs) - n, ",%zu", wiosz);
+
+                if (wiomax != SIZE_T_MAX) {
+                    snprintf(wrargs + n, sizeof(wrargs) - n, ",%zu", wiomax);
+                }
+            }
+        }
+
+        if (given['l']) {
+            if (partszpct) {
+                snprintf(partszbuf, sizeof(partszbuf), "-l%.0lf%%",
+                         partsz * 100.0 / partend);
+            } else if (partsz != partend) {
+                snprintf(partszbuf, sizeof(partszbuf), "-l%zu", partsz);
+            }
+        }
+
+        if (given['d']) {
+            snprintf(durbuf, sizeof(durbuf), "-d%ld", duration_orig);
+        }
+
         snprintf(bnfile, sizeof(bnfile),
-                 "%s-%s%u,%zu-%s%u,%zu-d%ld-l%.0lf%%-%ld",
-                 ofile,
-                 rsequential ? "R" : "r", rjobs, riosz,
-                 wsequential ? "W" : "w", wjobs, wiosz,
-                 duration_orig,
-                 partsz * 100.0 / partend,
+                 "%s%s%s%s%s-%ld",
+                 ofile, rdargs, wrargs,
+                 durbuf,
+                 partszbuf,
                  tv_alpha.tv_sec);
     }
 
