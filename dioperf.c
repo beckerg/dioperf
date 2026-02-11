@@ -516,15 +516,15 @@ rwtest(void *arg)
         a->bktv[dt]++;
         a->opstot++;
 
-        iomax += iosz;
+        iomax += a->iosz;
         if (iomax >= a->iomax)
             break;
 
         if (a->random) {
             off = (xrand() % partsz) & iosz_mask;
         } else {
-            off += iosz;
-            if (off > partsz - iosz)
+            off += a->iosz;
+            if (off > partsz - (ssize_t)a->iosz)
                 off = 0;
         }
     }
@@ -1386,7 +1386,7 @@ main(int argc, char **argv)
     if (rjobs < 1 && wjobs < 1)
         rjobs = 1;
 
-    if (riomax != SIZE_T_MAX || wiomax != SIZE_T_MAX) {
+    if (riomax < SIZE_T_MAX || wiomax < SIZE_T_MAX) {
         if (!given['d']) {
             duration = 86400;
         }
@@ -1629,6 +1629,9 @@ main(int argc, char **argv)
         if (siginfo || mark < duration) {
             static u_long reports = 0;
             time_t elapsed = itv_to_usecs(itv_cycles() - itv_alpha) / 1000000;
+            time_t remaining = duration - elapsed;
+            time_t wremaining = 0;
+            time_t rremaining = 0;
             u_long ropstot = 0;
             u_long wopstot = 0;
 
@@ -1642,19 +1645,42 @@ main(int argc, char **argv)
                 }
             }
 
+            if (rjobs == 0 || wjobs == 0 ||
+                (riomax < SIZE_T_MAX && wiomax < SIZE_T_MAX)) {
+
+                if (wjobs > 0 && wiomax < SIZE_T_MAX) {
+                    u_long bps = wopstot * wiosz / elapsed;
+
+                    if ((wjobs * wiomax) > (wopstot * wiosz))
+                        wremaining = ((wjobs * wiomax) - (wopstot * wiosz)) / bps;
+                }
+
+                if (rjobs > 0 && riomax < SIZE_T_MAX) {
+                    u_long bps = ropstot * riosz / elapsed;
+
+                    if ((rjobs * riomax) > (ropstot * riosz))
+                        rremaining = ((rjobs * riomax) - (ropstot * riosz)) / bps;
+                }
+
+                if (wremaining < remaining && wremaining > rremaining)
+                    remaining = wremaining;
+                else if (rremaining < remaining && rremaining > wremaining)
+                    remaining = rremaining;
+            }
+
             if (reports++ % 16 == 0) {
-                printf("%9s %9s %10s %15s %10s %10s %15s %10s\n",
+                printf("\n%9s %9s %10s %15s %10s %10s %15s %10s\n",
                        "elapsed", "remaining",
                        "rops", "rbytes", "kr/s",
                        "wops", "wbytes", "kw/s");
             }
 
             printf("%9ld %9ld %10zu %15zu %10zu %10zu %15zu %10zu\n",
-                   elapsed, duration - elapsed,
+                   elapsed, remaining,
                    ropstot, ropstot * riosz,
-                   (ropstot * riosz / elapsed) >> 10,
+                   (rjobs > 0) ? (ropstot * riosz / elapsed) >> 10 : 0,
                    wopstot, wopstot * wiosz,
-                   (wopstot * wiosz / elapsed) >> 10);
+                   (wjobs > 0) ? (wopstot * wiosz / elapsed) >> 10 : 0);
             siginfo = 0;
         }
     }
